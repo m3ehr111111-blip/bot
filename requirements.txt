@@ -1,0 +1,5 @@
+python-telegram-bot>=21
+telethon
+yt-dlp
+gTTS
+requests
