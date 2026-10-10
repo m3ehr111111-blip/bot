@@ -1,0 +1,2259 @@
+#!/usr/bin/env python3
+# language: Python 3.10+
+# file: shadow_all.py
+# target: Windows cmd / Linux / Termux / Railway worker
+# deps: pip install "python-telegram-bot>=21" telethon yt-dlp gTTS requests
+#
+# MODE A (default):  python shadow_all.py
+#   -> runs the onboarding bot (token below). /start is gated by ADMIN_ID
+#      approval. Once approved, /start collects API ID, API Hash, phone,
+#      OTP digit-by-digit, 2FA password. On success, wipes chat, spawns
+#      this same file as MODE B with per-user env, sends final thanks + logout.
+#
+# MODE B (auto-spawned):  python shadow_all.py --userbot <chat_id>
+#   -> runs the userbot (all the .raid .spray .menu commands) using the
+#      session/state/config that MODE A wrote to users/user_<chat_id>.json.
+
+import asyncio
+import atexit
+import copy
+import io
+import json
+import logging
+import os
+import random
+import re
+import signal
+import subprocess
+import sys
+import time
+import traceback
+from io import BytesIO
+from pathlib import Path
+from typing import Dict, Optional, Set
+
+# ------------------------------------------------------------------
+#  paths
+# ------------------------------------------------------------------
+BASE_DIR  = Path(__file__).resolve().parent
+USERS_DIR = BASE_DIR / "users"
+SESS_DIR  = BASE_DIR / "sessions"
+RUN_DIR   = BASE_DIR / "run"
+DL_DIR    = BASE_DIR / "downloads"
+TMP_DIR   = BASE_DIR / "temp"
+for d in (USERS_DIR, SESS_DIR, RUN_DIR, DL_DIR, TMP_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+BOT_TOKEN = "8855726336:AAFgXfhKTssjc9QSRwa0dhoBOWToqF_OjDo"
+
+# ------------------------------------------------------------------
+#  logging
+# ------------------------------------------------------------------
+logging.disable(logging.WARNING)
+for _n in ("telethon", "telethon.network", "telethon.network.mtprotosender",
+           "telethon.extensions", "telethon.client", "telethon.crypto",
+           "telegram", "telegram.ext", "httpx", "httpcore"):
+    logging.getLogger(_n).setLevel(logging.CRITICAL)
+
+LOG = logging.getLogger("shadow")
+LOG.setLevel(logging.INFO)
+if not LOG.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(message)s",
+                                      datefmt="%H:%M:%S"))
+    LOG.addHandler(_h)
+
+IS_USERBOT = "--userbot" in sys.argv
+
+# ------------------------------------------------------------------
+#  shared imports (only userbot side actually uses these)
+# ------------------------------------------------------------------
+try:
+    import requests
+    import yt_dlp
+    from gtts import gTTS
+    from telethon import TelegramClient, events, functions, types
+    from telethon.errors import (
+        FloodWaitError, RPCError, SessionPasswordNeededError,
+        PhoneCodeInvalidError, PhoneCodeExpiredError,
+        PasswordHashInvalidError, ApiIdInvalidError,
+    )
+    from telethon.tl.functions.channels import (
+        CreateChannelRequest, EditAdminRequest, EditTitleRequest,
+        InviteToChannelRequest, LeaveChannelRequest,
+    )
+    from telethon.tl.functions.messages import (
+        ExportChatInviteRequest, SendReactionRequest, EditChatTitleRequest,
+        AddChatUserRequest, EditChatAdminRequest,
+    )
+    from telethon.tl.functions.users import GetFullUserRequest
+    from telethon.tl.functions.account import UpdateProfileRequest
+    from telethon.tl.functions.photos import (
+        UploadProfilePhotoRequest, DeletePhotosRequest,
+    )
+    from telethon.tl.types import ChatAdminRights, ReactionEmoji
+except Exception as e:
+    print(f"missing dep: {e}")
+    print("pip install \"python-telegram-bot>=21\" telethon yt-dlp gTTS requests")
+    sys.exit(1)
+
+
+# ==================================================================
+# ==================================================================
+#  SECTION 1 — USERBOT  (env-driven)
+# ==================================================================
+# ==================================================================
+
+API_ID    = int(os.environ.get("SHADOW_API_ID",   "0"))
+API_HASH  = os.environ.get("SHADOW_API_HASH",     "")
+OWNER_ID  = int(os.environ.get("SHADOW_OWNER_ID", "0"))
+PHONE     = os.environ.get("SHADOW_PHONE",        "")
+SESSION   = os.environ.get("SHADOW_SESSION",      str(BASE_DIR / "shadoww"))
+STATE_FILE = os.environ.get("SHADOW_STATE",       str(BASE_DIR / "shadow_state.json"))
+
+BRAND = "𝐒 𝐇 𝐀 𝐃 𝐎 𝐖 𝐖"
+
+ADD_BOTS_LIST = [
+    "shadowspmbot", "shadowspm1bot", "shadowspm2bot", "shadowspm3bot", "shadowspm4bot",
+    "shadowspm5bot", "shadowspm6bot", "shadowspm7bot", "shadowspm8bot", "shadowspm9bot",
+]
+FASTGC_EMOJIS    = ["👾"] * 23
+GC_FAST_INTERVAL = 0.30
+MSG_CACHE_LIMIT  = 300
+SNIPE_LIMIT      = 50
+EDIT_LIMIT       = 30
+
+_DEFAULT_STATE = {
+    "admins":       [],
+    "mutes":        {},
+    "gmutes":       [],
+    "locks":        [],
+    "banner":       None,
+    "reply_targets":  [],
+    "rr_targets":     [],
+    "flag_targets":   [],
+    "shadow_targets": [],
+    "auto_react":   None,
+    "config": {
+        "spray_delay": 0.25,
+        "raid_delay":  0.25,
+        "cooldown":    1.0,
+        "debug":       False,
+    },
+}
+
+
+class State:
+    def __init__(self, path: str):
+        self.path = path
+        self.data = copy.deepcopy(_DEFAULT_STATE)
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                disk = json.load(f)
+            for k, v in disk.items():
+                self.data[k] = v
+        except FileNotFoundError:
+            pass
+        except json.JSONDecodeError:
+            LOG.warning("state file corrupt, starting fresh")
+        except Exception as e:
+            LOG.warning(f"state load failed: {e}")
+
+    def save(self):
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.path)
+        except Exception as e:
+            LOG.warning(f"state save failed: {e}")
+
+
+ST = State(STATE_FILE)
+
+admins: Set[int]         = set(int(x) for x in ST.data.get("admins", []) if str(x).lstrip("-").isdigit())
+global_muted: Set[int]   = set(int(x) for x in ST.data.get("gmutes", []) if str(x).lstrip("-").isdigit())
+group_locks: Set[int]    = set(int(x) for x in ST.data.get("locks", []) if str(x).lstrip("-").isdigit())
+muted_users: Dict[int, Set[int]] = {
+    int(k): set(int(u) for u in v)
+    for k, v in ST.data.get("mutes", {}).items()
+    if str(k).lstrip("-").isdigit()
+}
+reply_users: Set[int]      = set(int(x) for x in ST.data.get("reply_targets", []))
+rr_users: Set[int]         = set(int(x) for x in ST.data.get("rr_targets", []))
+flag_users: Set[int]       = set(int(x) for x in ST.data.get("flag_targets", []))
+replyshadow_users: Set[int]= set(int(x) for x in ST.data.get("shadow_targets", []))
+menu_banner_msg: Optional[tuple] = tuple(ST.data["banner"]) if ST.data.get("banner") else None
+auto_react_emoji: Optional[str]  = ST.data.get("auto_react")
+
+
+def persist():
+    ST.data["admins"]         = sorted(admins)
+    ST.data["gmutes"]         = sorted(global_muted)
+    ST.data["locks"]          = sorted(group_locks)
+    ST.data["mutes"]          = {str(k): sorted(v) for k, v in muted_users.items() if v}
+    ST.data["reply_targets"]  = sorted(reply_users)
+    ST.data["rr_targets"]     = sorted(rr_users)
+    ST.data["flag_targets"]   = sorted(flag_users)
+    ST.data["shadow_targets"] = sorted(replyshadow_users)
+    ST.data["auto_react"]     = auto_react_emoji
+    ST.data["banner"]         = list(menu_banner_msg) if menu_banner_msg else None
+    ST.save()
+
+
+# ---------- client (only used in userbot mode) ----------
+if API_ID and API_HASH:
+    bot = TelegramClient(
+        SESSION, API_ID, API_HASH,
+        auto_reconnect=True, connection_retries=10, retry_delay=2,
+        request_retries=5, timeout=30,
+    )
+else:
+    bot = None
+
+START_TIME = time.time()
+
+raid_tasks:  Dict[int, asyncio.Task] = {}
+spray_tasks: Dict[int, asyncio.Task] = {}
+swipe_tasks: Dict[int, asyncio.Task] = {}
+snipe_msgs:  Dict[int, Dict[int, dict]] = {}
+snipe_cache: Dict[int, list] = {}
+edit_cache:  Dict[int, list] = {}
+CLONE_ACTIVE  = False
+LAST_CLONE_ID = None
+CLONE_DATA    = {"name": None, "last": None, "bio": None, "photo_bytes": None}
+FASTGC_STATE  = {"active": False, "template": None, "task": None, "chat_id": None}
+_cooldowns: Dict[tuple, float] = {}
+
+
+RAID_MESSAGES = [
+    "👾 ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴀᴀɢ ʟᴀɢᴀ ᴅᴜɴɢᴀ 👾",
+    "👾 ʜᴀʀ ᴍᴇꜱꜱᴀɢᴇ ᴘᴇ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ʏᴀᴀᴅ ᴅɪʟᴀᴛᴀ ʜᴜ 👾",
+    "👾 ᴛᴇʀᴇ ʙᴀᴀᴘ ᴋᴀ ɴᴀᴀᴍ ʟᴇᴋᴇ ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴄʜᴏᴅ ᴅᴜɴɢᴀ 👾",
+    "👾 ᴋʏᴀ ʀᴇ ᴄʜᴏᴅᴜ ᴛʏᴘɪɴɢ ʀᴏᴋ ɢᴀʏɪ ᴋʏᴀ ᴛᴇʀɪ 👾",
+    "👾 ɴᴀꜱᴀ ꜱᴇ ɴᴇᴡꜱ ᴀᴀʏɪ ᴛᴇʀɪ ᴍᴀᴀ ɢᴀʟɪ ɢᴀʟɪ ᴄʜᴜᴅ ʀᴀʜɪ ʜᴀɪ 👾",
+    "👾 ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴘɪᴄ ᴅᴇᴋʜɪ ᴏʀ ʟᴜɴᴅ ᴋʜᴀᴅᴀ ʜᴏ ɢᴀʏᴀ 👾",
+    "👾 ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴍᴇɴᴇ ʀᴀɴᴅɪ ʙᴀɴᴀ ᴋᴇ ᴛᴇʀᴇ ᴄʜᴀᴄʜᴀ ᴋᴇ ꜱᴀᴛʜ ʙᴇᴄʜ ᴅɪʏᴀ 👾",
+    "👾 ʙʜᴏꜱᴅɪᴋᴇ ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ʙʜᴏꜱᴅᴀ ᴍᴇʀᴀ ʜᴀɪ ᴊᴀʙ ᴄʜᴀʜᴇ ᴄʜᴏᴅ ᴅᴜɴɢᴀ 👾",
+    "👾 ᴋʏᴀ ʀᴇ ᴍᴀᴅᴀʀᴄʜᴏᴅ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴇ ᴍᴇʀᴀ ʟᴜɴᴅ ɢʜᴜꜱᴀ ᴅᴜɴɢᴀ 👾",
+    "👾 ᴛᴇʀᴇ ᴋʜᴀɴᴅᴀɴ ᴋɪ ʟᴀꜱʜ ᴋᴏ ɢᴀʟɪ ɢᴀʟɪ ɢʜᴜᴍᴀᴜɴɢᴀ 👾",
+    "👾 ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴍᴇʀᴀ ʙᴇᴛᴀ ʜᴀɪ ᴊᴀɴᴛᴀ ʜᴀɪ ᴋʏᴀ 👾",
+    "👾 ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ ᴀᴋᴀʟ ᴀᴀᴛɪ ᴛᴏ ʙᴏʟ ᴡʀɴᴀ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀᴀʀ ᴅᴜɴɢᴀ 👾",
+]
+SWIPE_MESSAGES = [
+    "👾 ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴄʜᴏᴅ ᴋᴇ ᴋᴏᴛʜɪ ᴍᴇ ꜰᴇᴋ ᴀᴀᴜɴɢᴀ 👾",
+    "👾 ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ꜱᴜᴘᴇʀᴄᴀʀ ɢʜᴜꜱᴀ ᴅᴜɴɢᴀ 👾",
+    "👾 ᴋʏᴀ ʀᴇ ʀᴀɴᴅɪ ᴋᴇ ʀᴇᴘʟʏ ɴᴀʜɪ ᴋᴀʀᴛᴀ 👾",
+    "👾 ᴛᴇʀᴀ ʙᴀᴀᴘ ʜᴜ ᴍᴀɪ ᴄʜᴜᴘ ᴋᴀʀ ʀᴀɴᴅɪᴋᴇ 👾",
+    "👾 ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ʙʜᴏꜱᴅᴀ ᴛᴇʀᴇ ʜᴀᴡᴀʟᴇ ᴋᴀʀ ᴅᴜɴɢᴀ 👾",
+    "👾 ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴀᴀɢ ʟᴀɢᴀ ᴋᴇ ʀᴀᴀᴋʜ ᴋᴀʀ ᴅᴜɴɢᴀ 👾",
+    "👾 ᴇᴋ ᴍᴇꜱꜱᴀɢᴇ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ʟᴀꜱʜ ɢᴀʟɪ ᴍᴇ ᴘᴀᴅɪ ʜᴏɢɪ 👾",
+    "👾 ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴍᴇɴᴇ ʀᴀɴᴅɪ ʙᴀɴᴀ ᴅɪʏᴀ 👾",
+    "👾 ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʟᴜɴᴅ ᴅᴀᴀʟ ᴅᴜɴɢᴀ 👾",
+    "👾 ᴛᴇʀᴀ ᴋʜᴀɴᴅᴀɴ ᴋʜᴀᴛᴍ ᴛᴇʀɪ ᴍᴀᴀ ꜱᴇ ꜱʜᴜʀᴜ ʜᴏᴛᴀ ʜᴀɪ 👾",
+]
+reply_list = [
+    "ᴄʜᴜᴘ ᴋᴀʀ ʀᴀɴᴅɪ ᴋᴇ 👾", "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴀᴀɢ 👾",
+    "ᴋʏᴀ ʀᴇ ᴄʜᴏᴅᴜ ʀᴇᴘʟʏ ᴅᴇ 👾", "ᴛᴇʀɪ ʙᴇʜᴇɴ ʀᴀɴᴅɪ ʜᴀɪ 👾",
+    "ᴛᴇʀᴀ ʙᴀᴀᴘ ʜᴜ ᴍᴀɪ 👾", "ɢᴀᴀɴᴅ ᴍᴀʀᴀ ᴀᴘɴɪ ᴍᴀᴅᴀʀᴄʜᴏᴅ 👾",
+    "ꜱʜᴀᴋᴀʟ ᴅᴇᴋʜ ᴀᴘɴɪ 👾", "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ʙʜᴇᴊ ᴍᴇʀᴇ ᴘᴀᴀꜱ 👾",
+    "ᴄʜᴜᴅ ᴊᴀ ᴄʜᴜᴘᴄʜᴀᴘ 👾", "ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴇ ʟᴜɴᴅ 👾",
+    "ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ 👾", "ᴛᴇʀɪ ᴍᴀᴀ ᴄʜᴜᴅ ʀᴀʜɪ ʜᴀɪ 👾",
+    "ᴋʏᴀ ʀᴇ ɢᴀɴᴅᴜ 👾", "ᴛᴇʀᴀ ᴋʜᴀɴᴅᴀɴ ʀᴀɴᴅɪ ᴋʜᴀɴᴀ 👾",
+    "ᴀᴀ ᴊᴀ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀᴀʀᴜ 👾",
+]
+reply_texts = [
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʟᴜɴᴅ ᴅᴀᴀʟ ᴅᴜɴɢᴀ 👾",
+    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ʀᴏᴢ ᴄʜᴏᴅᴛᴀ ʜᴜ ᴍᴀɪ 👾",
+    "ᴀᴘɴɪ ᴍᴀᴀ ᴋᴏ ʙᴏʟ ᴋᴇ ᴀᴀ 👾",
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴍᴇʀᴇ ᴘᴀᴀꜱ ʙʜᴇᴊ 👾",
+    "ᴄʜᴜᴘ ᴋᴀʀ ᴡʀɴᴀ ɢᴀᴀɴᴅ ᴍᴀʀ ᴅᴜɴɢᴀ 👾",
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ɢᴀᴀɴᴅ ᴄʜᴀᴛ ᴅᴜɴɢᴀ 👾",
+    "ʟᴜɴᴅ ᴘᴇ ʙᴀɪᴛʜ ᴊᴀ 👾",
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴅᴀɪ ᴅᴇᴋʜ ʟᴇ ᴀᴘɴɪ 👾",
+    "ɢᴀɴᴅᴜ ᴋᴀʜɪ ᴋᴀ 👾",
+    "ꜱʜᴀᴋᴀʟ ꜱᴇ ʜɪ ʀᴀɴᴅɪ ʟᴀɢᴛᴀ ʜᴀɪ 👾",
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ꜱᴀᴍʙʜᴀʟ ᴋᴇ ʀᴀᴋʜ 👾",
+    "ᴍᴀᴀ ᴄʜᴜᴅᴀ ᴀᴘɴɪ ʏᴀʜᴀ ꜱᴇ 👾",
+]
+fun_texts = [
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴇ ʙʜᴏꜱᴅᴇ ᴍᴇ ᴍᴇʀᴀ ʟᴜɴᴅ ꜰᴀꜱ ɢᴀʏᴀ 👾",
+    "ᴋʏᴀ ʀᴇ ᴄʜᴏᴅᴜ ʀᴇᴘʟʏ ɴᴀʜɪ ᴋᴀʀ ʀᴀʜᴀ 👾",
+    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ᴄʜᴏᴅ ᴄʜᴜᴋᴀ ʜᴜ ᴍᴀɪ 👾",
+    "ᴀᴘɴɪ ᴍᴀᴀ ᴋɪ ꜱʜᴀᴋᴀʟ ᴅᴇᴋʜ ʟᴇ 👾",
+    "ɢᴀᴀɴᴅ ᴍᴀʀᴀ ʟᴇ ᴀᴘɴɪ 👾",
+    "ᴋʏᴀ ʀᴇ ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ 👾",
+    "ᴄʜᴜᴅ ᴊᴀ ʙʜᴀɪ ᴄʜᴜᴘᴄʜᴀᴘ 👾",
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴀᴀɢ ʟᴀɢᴀ ᴅᴜɴɢᴀ 👾",
+]
+flag_texts = [
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʜᴀᴍʟᴀ ᴋᴀʀ ᴅᴜɴɢᴀ 👾",
+    "ᴀᴘɴɪ ᴍᴀᴀ ᴋᴏ ꜱᴀᴍʙʜᴀʟ ᴋᴇ ʀᴀᴋʜ 👾",
+    "ʙᴏʟ ᴋʏᴀ ᴘʀᴏʙʟᴇᴍ ʜᴀɪ 👾",
+    "ᴋʏᴀ ʀᴇ ɢᴀɴᴅᴜ 👾",
+    "ᴍᴀᴀ ᴄʜᴜᴅᴀ ᴀᴘɴɪ 👾",
+    "ᴄʜᴜᴅ ᴊᴀ ᴄʜᴜᴘᴄʜᴀᴘ 👾",
+    "ᴀᴀ ᴊᴀ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀᴀʀᴜ 👾",
+    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴀɪꜱɪ ʜᴀɪ 👾",
+]
+
+
+# ---------- helpers ----------
+def now() -> float: return time.time()
+
+def is_admin(uid: Optional[int]) -> bool:
+    if not uid: return False
+    return uid == OWNER_ID or uid in admins
+
+def is_user_muted(chat_id: int, user_id: int) -> bool:
+    if user_id in global_muted: return True
+    return chat_id in muted_users and user_id in muted_users[chat_id]
+
+async def safe_edit(event, text: str, **kw):
+    if not text: return None
+    try:
+        return await event.edit(text, **kw)
+    except FloodWaitError as fw:
+        await asyncio.sleep(fw.seconds + 1)
+        try: return await event.edit(text, **kw)
+        except Exception: pass
+    except Exception:
+        pass
+    try:
+        return await event.reply(text, **kw)
+    except Exception:
+        return None
+
+async def safe_delete(event, msgs=None):
+    try:
+        if msgs is None:
+            await event.delete()
+        else:
+            await bot.delete_messages(event.chat_id, msgs)
+    except Exception:
+        pass
+
+async def get_targets(event, arg: str = "") -> Set[int]:
+    targets: Set[int] = set()
+    if event.is_reply:
+        try:
+            r = await event.get_reply_message()
+            if r and r.sender_id: targets.add(int(r.sender_id))
+        except Exception: pass
+    if arg:
+        for part in arg.strip().split():
+            if not part: continue
+            if part.lstrip("-").isdigit():
+                try: targets.add(int(part)); continue
+                except Exception: pass
+            try:
+                ent = await bot.get_entity(part)
+                if ent and getattr(ent, "id", None): targets.add(int(ent.id))
+            except Exception: pass
+    try:
+        me = await bot.get_me(); targets.discard(me.id)
+    except Exception: pass
+    return targets
+
+async def resolve_bot(username: str):
+    for fn in (
+        lambda: bot.get_entity(username),
+        lambda: bot(functions.contacts.ResolveUsernameRequest(username=username)),
+    ):
+        try:
+            r = await fn()
+            if r and getattr(r, "id", None): return r
+            if r and getattr(r, "users", None): return r.users[0]
+        except Exception:
+            pass
+    try:
+        async for d in bot.iter_dialogs(limit=300):
+            u = d.entity
+            un = getattr(u, "username", None)
+            if un and un.lower() == username.lower(): return u
+    except Exception:
+        pass
+    return None
+
+def human_uptime(seconds: int) -> str:
+    d, r = divmod(seconds, 86400)
+    h, r = divmod(r, 3600)
+    m, s = divmod(r, 60)
+    if d: return f"{d}d {h}h {m}m"
+    if h: return f"{h}h {m}m {s}s"
+    if m: return f"{m}m {s}s"
+    return f"{s}s"
+
+
+commands: Dict[str, dict] = {}
+
+def register_cmd(name, needs_reply=False, group_only=False, cooldown=None):
+    def deco(func):
+        key = (name or "").lower().strip()
+        if not key: raise ValueError("empty command name")
+        commands[key] = {
+            "func": func,
+            "needs_reply": needs_reply,
+            "group_only": group_only,
+            "cooldown": cooldown,
+        }
+        return func
+    return deco
+
+def check_cooldown(uid: int, cmd: str, secs: float) -> bool:
+    if secs <= 0: return True
+    key = (uid, cmd)
+    t = now()
+    if t - _cooldowns.get(key, 0) < secs: return False
+    _cooldowns[key] = t
+    return True
+
+async def run_with_flood_retry(coro_factory, event, cmd_name: str):
+    try:
+        return await coro_factory()
+    except FloodWaitError as fw:
+        LOG.warning(f"[{cmd_name}] flood {fw.seconds}s, retrying")
+        await asyncio.sleep(fw.seconds + 1)
+        return await coro_factory()
+    except asyncio.CancelledError:
+        raise
+    except RPCError as e:
+        await safe_edit(event, f"👾 RPC: {str(e)[:120]}")
+    except Exception as e:
+        LOG.error(f"[{cmd_name}] {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        await safe_edit(event, f"👾 {type(e).__name__}: {str(e)[:100]}")
+
+
+MENU_TEXT = f"""
+╔══════════════════════════════╗
+      👾   {BRAND}   👾
+╚══════════════════════════════╝
+
+╭━━━━━ 👾 𝐀𝐃𝐌𝐈𝐍 ━━━━━╮
+┃ 👾 .admins       » admin list
+┃ 👾 .addadmin     » add admin
+┃ 👾 .deladmin     » remove admin
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━ 👾 𝐂𝐇𝐀𝐓 ━━━━━━╮
+┃ 👾 .id / .chatinfo
+┃ 👾 .gc <name>    » create gc
+┃ 👾 .pin / .unpin / .leave
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━ 👾 𝐌𝐔𝐓𝐄 ━━━━━━╮
+┃ 👾 .mute / .unmute   » local
+┃ 👾 .gmute / .gunmute » global
+┃ 👾 .mutelist / .lock / .unlock
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━ 👾 𝐆𝐑𝐎𝐔𝐏 ━━━━━╮
+┃ 👾 .purge / .throw
+┃ 👾 .add / .addall / .addbots
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━ 👾 𝐑𝐀𝐈𝐃 ━━━━━━╮
+┃ 👾 .reply / .sreply
+┃ 👾 .rr / .srr
+┃ 👾 .flag / .sflag
+┃ 👾 .replyshadow / .sshadow
+┃ 👾 .raid / .sraid
+┃ 👾 .swipe / .sswipe
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━ 👾 𝐒𝐏𝐀𝐌 ━━━━━━╮
+┃ 👾 .spray / .dspray
+┃ 👾 .fastgc set/stop
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━ 👾 𝐀𝐔𝐓𝐎 ━━━━━━╮
+┃ 👾 .ar <emoji> / .sar
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━ 👾 𝐒𝐍𝐈𝐏𝐄 ━━━━━╮
+┃ 👾 .snipe / .edit / .seen
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━ 👾 𝐓𝐎𝐎𝐋𝐒 ━━━━━╮
+┃ 👾 .dl / .music / .voice / .weather
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━ 👾 𝐏𝐑𝐎𝐅𝐈𝐋𝐄 ━━━╮
+┃ 👾 .copy / .normal
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━ 👾 𝐒𝐘𝐒 ━━━━━━━╮
+┃ 👾 .ping / .status / .stats / .health
+┃ 👾 .backup / .restore / .reload
+┃ 👾 .debug on/off / .stopall
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━ 👾 𝐅𝐔𝐍 ━━━━━━━╮
+┃ 👾 .flip / .dice / .info
+╰━━━━━━━━━━━━━━━━━━━━╯
+""".strip()
+
+
+# ---------- commands ----------
+@register_cmd("menu")
+async def cmd_menu(event, _):
+    if event.out:
+        try: await event.edit(MENU_TEXT)
+        except Exception:
+            try: await event.reply(MENU_TEXT)
+            except Exception: pass
+    else:
+        await safe_delete(event)
+        try: await bot.send_message(event.chat_id, MENU_TEXT)
+        except Exception: pass
+
+@register_cmd("admins")
+async def cmd_admins(event, _):
+    body = "\n".join(f"▸ `{a}`" for a in sorted(admins)) if admins else "▸ none"
+    txt = (f"👾━━〔 ᴀᴅᴍɪɴꜱ 〕━━👾\nowner ➤ `{OWNER_ID}`\n\n{body}\n\n"
+           f"total ➤ {len(admins)}\n👾━━━━━━━━━━━━━━━━👾")
+    await safe_edit(event, txt)
+
+@register_cmd("addadmin", needs_reply=True)
+async def cmd_addadmin(event, arg):
+    targets = await get_targets(event, arg)
+    if not targets: return await safe_edit(event, "Reply or @user / ID")
+    added, already = [], []
+    for uid in targets:
+        if uid == OWNER_ID: continue
+        if uid in admins: already.append(str(uid))
+        else: admins.add(uid); added.append(str(uid))
+    persist()
+    parts = []
+    if added:   parts.append(f"added: {', '.join(added)}")
+    if already: parts.append(f"already: {', '.join(already)}")
+    await safe_edit(event, "\n".join(parts) or "No changes")
+
+@register_cmd("deladmin", needs_reply=True)
+async def cmd_deladmin(event, arg):
+    targets = await get_targets(event, arg)
+    if not targets: return await safe_edit(event, "Reply or @user / ID")
+    removed, not_admin = [], []
+    for uid in targets:
+        if uid == OWNER_ID: continue
+        if uid in admins: admins.discard(uid); removed.append(str(uid))
+        else: not_admin.append(str(uid))
+    persist()
+    parts = []
+    if removed:    parts.append(f"removed: {', '.join(removed)}")
+    if not_admin:  parts.append(f"not admin: {', '.join(not_admin)}")
+    await safe_edit(event, "\n".join(parts) or "No changes")
+
+@register_cmd("id")
+async def cmd_id(event, arg):
+    lines = [f"your id ➤ `{event.sender_id}`", f"chat id ➤ `{event.chat_id}`"]
+    if event.is_reply:
+        try:
+            r = await event.get_reply_message()
+            if r:
+                lines.append(f"reply id ➤ `{r.sender_id}`")
+                lines.append(f"msg id ➤ `{r.id}`")
+        except Exception: pass
+    txt = "╭━━━〔 👾 𝙄𝘿 👾 〕━━━╮\n" + "\n".join("┃ " + l for l in lines) + \
+          "\n╰━━━━━━━━━━━━━━━━━━━╯"
+    if event.out: await safe_edit(event, txt)
+    else: await event.reply(txt)
+
+@register_cmd("chatinfo")
+async def cmd_chatinfo(event, _):
+    try:
+        chat = await event.get_chat()
+        full = await bot(functions.channels.GetFullChannelRequest(chat.id)) \
+               if isinstance(chat, types.Channel) \
+               else await bot(functions.messages.GetFullChatRequest(chat_id=chat.id))
+        about = getattr(full.full_chat, "about", "") or ""
+        members = getattr(full.full_chat, "participants_count", None)
+        txt = (f"👾━━〔 ᴄʜᴀᴛ ɪɴꜰᴏ 〕━━👾\n"
+               f"▸ id    : `{chat.id}`\n▸ title : {getattr(chat, 'title', 'n/a')}\n"
+               f"▸ user  : @{getattr(chat, 'username', None) or 'none'}\n"
+               f"▸ type  : {type(chat).__name__}\n"
+               f"▸ count : {members if members is not None else 'n/a'}\n"
+               f"▸ about : {about[:200]}\n👾━━━━━━━━━━━━━━━━👾")
+        await safe_edit(event, txt)
+    except Exception as e:
+        await safe_edit(event, f"👾 {str(e)[:100]}")
+
+@register_cmd("pin", needs_reply=True)
+async def cmd_pin(event, arg):
+    try:
+        r = await event.get_reply_message()
+        await bot.pin_message(event.chat_id, r.id, notify=False)
+        await safe_edit(event, "👾 Pinned")
+    except Exception as e:
+        await safe_edit(event, f"👾 {str(e)[:80]}")
+
+@register_cmd("unpin")
+async def cmd_unpin(event, _):
+    try:
+        await bot.unpin_message(event.chat_id)
+        await safe_edit(event, "👾 Unpinned")
+    except Exception as e:
+        await safe_edit(event, f"👾 {str(e)[:80]}")
+
+@register_cmd("gc")
+async def cmd_gc(event, arg):
+    if not arg: return await safe_edit(event, "Use: .gc <name>")
+    title = arg.strip()[:128]
+    await safe_edit(event, "👾 Creating...")
+    try:
+        result = await bot(CreateChannelRequest(title=title, about="", megagroup=True))
+        new_chat = result.chats[0]
+        link = None
+        try:
+            inv = await bot(ExportChatInviteRequest(peer=new_chat.id))
+            link = getattr(inv, "link", None)
+        except Exception: pass
+        await safe_delete(event)
+        conf = (f"👾 ɢᴄ ᴄʀᴇᴀᴛᴇᴅ 👾\n\n  ▸ ɴᴀᴍᴇ : {title}\n  ▸ ɪᴅ   : `{new_chat.id}`")
+        if link: conf += f"\n  ▸ ʟɪɴᴋ : {link}"
+        try: await bot.send_message(event.chat_id, conf)
+        except Exception: pass
+    except FloodWaitError as fw:
+        await safe_edit(event, f"👾 Flood {fw.seconds}s")
+    except Exception as e:
+        await safe_edit(event, f"👾 {str(e)[:100]}")
+
+@register_cmd("leave")
+async def cmd_leave(event, _):
+    try:
+        await safe_delete(event)
+        await bot(LeaveChannelRequest(channel=event.chat_id))
+    except Exception:
+        try: await bot.delete_dialog(event.chat_id)
+        except Exception: pass
+
+@register_cmd("mute", needs_reply=True)
+async def cmd_mute(event, arg):
+    targets = await get_targets(event, arg)
+    if not targets: return await safe_edit(event, "Reply or @user / ID")
+    chat_id = event.chat_id
+    muted_users.setdefault(chat_id, set())
+    added, already = [], []
+    for uid in targets:
+        if uid in muted_users[chat_id]: already.append(str(uid))
+        else: muted_users[chat_id].add(uid); added.append(str(uid))
+    persist()
+    parts = []
+    if added:   parts.append(f"👾 muted: {', '.join(added)}")
+    if already: parts.append(f"👾 already: {', '.join(already)}")
+    await safe_edit(event, "\n".join(parts) or "No changes")
+
+@register_cmd("unmute", needs_reply=True)
+async def cmd_unmute(event, arg):
+    targets = await get_targets(event, arg)
+    if not targets: return await safe_edit(event, "Reply or @user / ID")
+    chat_id = event.chat_id
+    removed, not_muted = [], []
+    for uid in targets:
+        if chat_id in muted_users and uid in muted_users[chat_id]:
+            muted_users[chat_id].discard(uid); removed.append(str(uid))
+        else: not_muted.append(str(uid))
+    if chat_id in muted_users and not muted_users[chat_id]:
+        muted_users.pop(chat_id, None)
+    persist()
+    parts = []
+    if removed:   parts.append(f"👾 unmuted: {', '.join(removed)}")
+    if not_muted: parts.append(f"👾 wasn't muted: {', '.join(not_muted)}")
+    await safe_edit(event, "\n".join(parts) or "No changes")
+
+@register_cmd("gmute", needs_reply=True)
+async def cmd_gmute(event, arg):
+    targets = await get_targets(event, arg)
+    if not targets: return await safe_edit(event, "Reply or @user / ID")
+    added, already = [], []
+    for uid in targets:
+        if uid in global_muted: already.append(str(uid))
+        else: global_muted.add(uid); added.append(str(uid))
+    persist()
+    parts = []
+    if added:   parts.append(f"👾 global muted: {', '.join(added)}")
+    if already: parts.append(f"👾 already: {', '.join(already)}")
+    await safe_edit(event, "\n".join(parts) or "No changes")
+
+@register_cmd("gunmute", needs_reply=True)
+async def cmd_gunmute(event, arg):
+    targets = await get_targets(event, arg)
+    if not targets: return await safe_edit(event, "Reply or @user / ID")
+    removed, not_muted = [], []
+    for uid in targets:
+        if uid in global_muted: global_muted.discard(uid); removed.append(str(uid))
+        else: not_muted.append(str(uid))
+    persist()
+    parts = []
+    if removed:   parts.append(f"👾 globally unmuted: {', '.join(removed)}")
+    if not_muted: parts.append(f"👾 wasn't muted: {', '.join(not_muted)}")
+    await safe_edit(event, "\n".join(parts) or "No changes")
+
+@register_cmd("mutelist")
+async def cmd_mutelist(event, _):
+    txt = "👾━━━ mute panel ━━━👾\n\n"
+    local = muted_users.get(event.chat_id, set())
+    txt += "👾 this chat:\n"
+    if local:
+        for uid in list(local): txt += f"▸ `{uid}`\n"
+    else: txt += "▸ none\n"
+    txt += "\n👾 global:\n"
+    if global_muted:
+        for uid in list(global_muted): txt += f"▸ `{uid}`\n"
+    else: txt += "▸ none\n"
+    txt += "\n👾 locked gc:\n"
+    if group_locks:
+        for gid in list(group_locks): txt += f"▸ `{gid}`\n"
+    else: txt += "▸ none\n"
+    await safe_edit(event, txt)
+
+@register_cmd("lock", group_only=True)
+async def cmd_lock(event, _):
+    try:
+        perms = await bot.get_permissions(event.chat_id, "me")
+        if not perms.is_admin: return await safe_edit(event, "Need admin rights")
+    except Exception:
+        return await safe_edit(event, "Permission check failed")
+    if event.chat_id in group_locks: return await safe_edit(event, "Already locked")
+    group_locks.add(event.chat_id); persist()
+    await safe_edit(event, "👾 Group locked")
+
+@register_cmd("unlock", group_only=True)
+async def cmd_unlock(event, _):
+    try:
+        perms = await bot.get_permissions(event.chat_id, "me")
+        if not perms.is_admin: return await safe_edit(event, "Need admin rights")
+    except Exception:
+        return await safe_edit(event, "Permission check failed")
+    if event.chat_id not in group_locks: return await safe_edit(event, "Not locked")
+    group_locks.discard(event.chat_id); persist()
+    await safe_edit(event, "👾 Group unlocked")
+
+@register_cmd("purge")
+async def cmd_purge(event, arg):
+    try: count = int(arg) if arg else 50
+    except Exception: count = 50
+    count = max(1, min(count, 300))
+    await safe_edit(event, "Purging...")
+    ids = []
+    try:
+        async for m in bot.iter_messages(event.chat_id, limit=count + 1):
+            ids.append(m.id)
+    except Exception: pass
+    if not ids: return await safe_edit(event, "No messages")
+    try: await bot.delete_messages(event.chat_id, ids)
+    except FloodWaitError as fw:
+        await asyncio.sleep(fw.seconds + 1)
+        try: await bot.delete_messages(event.chat_id, ids)
+        except Exception: pass
+    except Exception: pass
+    await safe_edit(event, f"Purged: {max(len(ids) - 1, 0)}")
+
+@register_cmd("throw", needs_reply=True, group_only=True)
+async def cmd_throw(event, arg):
+    targets = await get_targets(event, arg)
+    if not targets: return await safe_edit(event, "Reply or @user / id")
+    try:
+        perms = await bot.get_permissions(event.chat_id, "me")
+        if not perms.is_admin: return await safe_edit(event, "Need admin rights")
+    except Exception:
+        return await safe_edit(event, "Permission check failed")
+    kicked, failed, skipped = [], [], []
+    me = await bot.get_me()
+    for uid in targets:
+        if uid == me.id: skipped.append(str(uid)); continue
+        try:
+            await bot.kick_participant(event.chat_id, uid); kicked.append(str(uid))
+        except Exception: failed.append(str(uid))
+    parts = []
+    if kicked:  parts.append(f"kicked: {', '.join(kicked)}")
+    if failed:  parts.append(f"failed: {', '.join(failed)}")
+    if skipped: parts.append(f"skipped: {', '.join(skipped)}")
+    await safe_edit(event, "\n".join(parts) or "No changes")
+
+async def _invite_and_promote(chat_id: int, username: str) -> str:
+    try:
+        ent = await resolve_bot(username)
+        if not ent: return "failed"
+        try: chat = await bot.get_entity(chat_id)
+        except Exception: return "failed"
+        is_channel = isinstance(chat, types.Channel)
+        is_basic   = isinstance(chat, types.Chat)
+        result = "failed"
+        if is_channel:
+            try:
+                await bot(InviteToChannelRequest(channel=chat_id, users=[ent]))
+                result = "added"
+            except Exception as ie:
+                s = str(ie)
+                if "USER_ALREADY_PARTICIPANT" in s or "already" in s.lower():
+                    result = "already"
+                else: return "failed"
+        elif is_basic:
+            try:
+                await bot(AddChatUserRequest(chat_id=chat.id, user_id=ent, fwd_limit=0))
+                result = "added"
+            except Exception as ie:
+                s = str(ie)
+                if "USER_ALREADY_PARTICIPANT" in s or "already" in s.lower():
+                    result = "already"
+                else: return "failed"
+        else: return "failed"
+        if is_channel:
+            try:
+                await bot(EditAdminRequest(
+                    channel=chat_id, user_id=ent,
+                    admin_rights=ChatAdminRights(
+                        change_info=True, delete_messages=True, ban_users=True,
+                        invite_users=True, pin_messages=True, add_admins=False,
+                        anonymous=False, manage_call=True, other=True,
+                    ), rank="Bot Admin"))
+            except Exception: pass
+        elif is_basic:
+            try:
+                await bot(EditChatAdminRequest(chat_id=chat.id, user_id=ent, is_admin=True))
+            except Exception: pass
+        return "promoted" if result == "already" else result
+    except Exception as e:
+        LOG.warning(f"invite {username} failed: {e}")
+        return "failed"
+
+async def _add_engine(event, count: int, label: str):
+    try:
+        perms = await bot.get_permissions(event.chat_id, "me")
+        if not perms.is_admin: return await safe_edit(event, "Need admin rights")
+    except Exception:
+        return await safe_edit(event, "Permission check failed")
+    await safe_edit(event, f"{label}: {count} bots")
+    added = promoted = 0
+    failed = []
+    for name in ADD_BOTS_LIST[:count]:
+        res = await _invite_and_promote(event.chat_id, name)
+        if res in ("added", "already"): added += 1
+        elif res == "promoted":        added += 1; promoted += 1
+        else:                          failed.append(name)
+        await asyncio.sleep(0)
+    txt = f"{label} done\nadded: {added}\npromoted: {promoted}"
+    if failed: txt += f"\nfailed: {', '.join(failed)}"
+    await safe_edit(event, txt)
+
+@register_cmd("add",     group_only=True)
+async def cmd_add(event, arg):     await _add_engine(event, len(ADD_BOTS_LIST), "add")
+
+@register_cmd("addall",  group_only=True)
+async def cmd_addall(event, arg):  await _add_engine(event, len(ADD_BOTS_LIST), "add all")
+
+@register_cmd("addbots", group_only=True)
+async def cmd_addbots(event, arg):
+    if not arg: return await safe_edit(event, "Use: .addbots <count>")
+    try: n = int(arg.strip())
+    except Exception: return await safe_edit(event, "Count must be number")
+    n = max(1, min(n, len(ADD_BOTS_LIST)))
+    await _add_engine(event, n, "addbots")
+
+async def _toggle_target(event, arg, target_set: Set[int], label: str):
+    targets = await get_targets(event, arg)
+    if not targets: return await safe_edit(event, "Reply or @user / ID")
+    added, already = [], []
+    for uid in targets:
+        if uid in target_set: already.append(str(uid))
+        else: target_set.add(uid); added.append(str(uid))
+    persist()
+    parts = []
+    if added:   parts.append(f"{label} on: {', '.join(added)}")
+    if already: parts.append(f"already: {', '.join(already)}")
+    await safe_edit(event, "\n".join(parts) or "No changes")
+
+async def _stop_target(event, arg, target_set: Set[int], label: str):
+    targets = await get_targets(event, arg)
+    if targets:
+        stopped, na = [], []
+        for uid in targets:
+            if uid in target_set: target_set.discard(uid); stopped.append(str(uid))
+            else: na.append(str(uid))
+        parts = []
+        if stopped: parts.append(f"stopped: {', '.join(stopped)}")
+        if na:      parts.append(f"not active: {', '.join(na)}")
+        txt = "\n".join(parts) or "No changes"
+    else:
+        target_set.clear()
+        txt = f"{label} off (all)"
+    persist()
+    await safe_edit(event, txt)
+
+@register_cmd("reply",       needs_reply=True)
+async def cmd_reply(event, arg):       await _toggle_target(event, arg, reply_users,       "reply raid")
+@register_cmd("rr",          needs_reply=True)
+async def cmd_rr(event, arg):          await _toggle_target(event, arg, rr_users,          "rr")
+@register_cmd("flag",        needs_reply=True)
+async def cmd_flag(event, arg):        await _toggle_target(event, arg, flag_users,        "flag")
+@register_cmd("replyshadow", needs_reply=True)
+async def cmd_replyshadow(event, arg): await _toggle_target(event, arg, replyshadow_users, "shadow")
+@register_cmd("sreply")
+async def cmd_sreply(event, arg):      await _stop_target(event, arg, reply_users,       "reply raid")
+@register_cmd("srr")
+async def cmd_srr(event, arg):         await _stop_target(event, arg, rr_users,          "rr")
+@register_cmd("sflag")
+async def cmd_sflag(event, arg):       await _stop_target(event, arg, flag_users,        "flag")
+@register_cmd("sshadow")
+async def cmd_sshadow(event, arg):     await _stop_target(event, arg, replyshadow_users, "shadow")
+
+async def _raid_worker(chat, reply_to_id: int, chat_id: int):
+    try:
+        while True:
+            for msg in RAID_MESSAGES:
+                if chat_id not in raid_tasks: return
+                try: await bot.send_message(chat, msg, reply_to=reply_to_id)
+                except FloodWaitError as fw: await asyncio.sleep(fw.seconds + 1)
+                except asyncio.CancelledError: raise
+                except Exception: await asyncio.sleep(0.3)
+                await asyncio.sleep(ST.data["config"]["raid_delay"])
+    except asyncio.CancelledError: return
+    finally: raid_tasks.pop(chat_id, None)
+
+@register_cmd("raid", needs_reply=True, group_only=True)
+async def cmd_raid(event, arg):
+    chat_id = event.chat_id
+    if chat_id in raid_tasks and not raid_tasks[chat_id].done():
+        return await safe_edit(event, "Raid already active")
+    reply_msg = await event.get_reply_message()
+    try: chat = await event.get_input_chat()
+    except Exception: chat = chat_id
+    await safe_delete(event)
+    raid_tasks[chat_id] = asyncio.create_task(_raid_worker(chat, reply_msg.id, chat_id))
+
+@register_cmd("sraid")
+async def cmd_sraid(event, _):
+    task = raid_tasks.get(event.chat_id)
+    if not task or task.done(): return await safe_edit(event, "No raid running")
+    task.cancel(); raid_tasks.pop(event.chat_id, None)
+    await safe_edit(event, "👾 Raid stopped")
+
+async def _swipe_worker(chat_id: int, reply_to_id: int):
+    try:
+        for msg in SWIPE_MESSAGES:
+            if chat_id not in swipe_tasks: return
+            try: await bot.send_message(chat_id, msg, reply_to=reply_to_id)
+            except FloodWaitError as fw: await asyncio.sleep(fw.seconds + 1)
+            except asyncio.CancelledError: raise
+            except Exception: await asyncio.sleep(0.3)
+            await asyncio.sleep(0.25)
+    except asyncio.CancelledError: return
+    finally: swipe_tasks.pop(chat_id, None)
+
+@register_cmd("swipe", needs_reply=True, group_only=True)
+async def cmd_swipe(event, arg):
+    chat_id = event.chat_id
+    if chat_id in swipe_tasks and not swipe_tasks[chat_id].done():
+        return await safe_edit(event, "Swipe already running")
+    reply_msg = await event.get_reply_message()
+    await safe_delete(event)
+    swipe_tasks[chat_id] = asyncio.create_task(_swipe_worker(chat_id, reply_msg.id))
+
+@register_cmd("sswipe")
+async def cmd_sswipe(event, _):
+    task = swipe_tasks.get(event.chat_id)
+    if not task or task.done(): return await safe_edit(event, "No swipe running")
+    task.cancel(); swipe_tasks.pop(event.chat_id, None)
+    await safe_edit(event, "👾 Swipe stopped")
+
+@register_cmd("spray")
+async def cmd_spray(event, arg):
+    if not arg: return await safe_edit(event, "Use: .spray <text>")
+    chat = event.chat_id
+    arg = arg[:4000]
+    if chat in spray_tasks and not spray_tasks[chat].done():
+        return await safe_edit(event, "Spray already active")
+    async def loop():
+        try:
+            while True:
+                if chat not in spray_tasks: break
+                try: await bot.send_message(chat, arg)
+                except FloodWaitError as fw: await asyncio.sleep(fw.seconds + 1)
+                except asyncio.CancelledError: raise
+                except RPCError: break
+                except Exception: await asyncio.sleep(0.3)
+                await asyncio.sleep(ST.data["config"]["spray_delay"])
+        except asyncio.CancelledError: pass
+        finally: spray_tasks.pop(chat, None)
+    spray_tasks[chat] = asyncio.create_task(loop())
+    await safe_edit(event, f"Spray started\n{arg[:40]}")
+
+@register_cmd("dspray")
+async def cmd_dspray(event, _):
+    chat = event.chat_id
+    task = spray_tasks.get(chat)
+    if not task: return await safe_edit(event, "No spray active")
+    task.cancel(); spray_tasks.pop(chat, None)
+    await safe_edit(event, "Spray stopped")
+
+async def _fast_title(chat_id, title: str) -> bool:
+    t = (title or "").strip()[:255]
+    if not t: return False
+    try:
+        await bot(EditTitleRequest(channel=chat_id, title=t)); return True
+    except Exception:
+        try:
+            await bot(EditChatTitleRequest(chat_id=chat_id, title=t)); return True
+        except Exception: return False
+
+async def _fastgc_loop(chat_id: int):
+    try:
+        while FASTGC_STATE.get("active"):
+            tpl = FASTGC_STATE.get("template")
+            if not tpl: break
+            new = tpl.replace("{emoji}", random.choice(FASTGC_EMOJIS))
+            ok = await _fast_title(chat_id, new)
+            await asyncio.sleep(GC_FAST_INTERVAL if ok else 1.0)
+    except asyncio.CancelledError: return
+    except Exception as e: LOG.warning(f"fastgc loop: {e}")
+
+@register_cmd("fastgc")
+async def cmd_fastgc(event, arg):
+    if not arg: return await safe_edit(event, "Use: .fastgc set <template {emoji}> | .fastgc stop")
+    arg = arg.strip()
+    if arg.startswith("set "):
+        tpl = arg[4:].strip()
+        if "{emoji}" not in tpl: return await safe_edit(event, "Template must contain {emoji}")
+        FASTGC_STATE["active"]   = True
+        FASTGC_STATE["template"] = tpl
+        FASTGC_STATE["chat_id"]  = event.chat_id
+        old = FASTGC_STATE.get("task")
+        if old and not old.done(): old.cancel()
+        FASTGC_STATE["task"] = asyncio.create_task(_fastgc_loop(event.chat_id))
+        return await safe_edit(event, "FastGC started")
+    if arg == "stop":
+        FASTGC_STATE["active"]   = False
+        FASTGC_STATE["template"] = None
+        old = FASTGC_STATE.get("task")
+        if old: old.cancel()
+        FASTGC_STATE["task"] = None
+        return await safe_edit(event, "FastGC stopped")
+    return await safe_edit(event, "Use: .fastgc set <template {emoji}> | .fastgc stop")
+
+@register_cmd("ar")
+async def cmd_ar(event, arg):
+    global auto_react_emoji
+    if not arg: return await safe_edit(event, "Use: .ar <emoji>")
+    emoji = arg.strip()
+    if len(emoji) > 8: return await safe_edit(event, "Emoji too long")
+    auto_react_emoji = emoji; persist()
+    await safe_edit(event, f"Auto-react on ➤ {emoji}")
+
+@register_cmd("sar")
+async def cmd_sar(event, _):
+    global auto_react_emoji
+    if auto_react_emoji is None: return await safe_edit(event, "Not active")
+    auto_react_emoji = None; persist()
+    await safe_edit(event, "Auto-react off")
+
+@register_cmd("snipe")
+async def cmd_snipe(event, arg):
+    chat_id = event.chat_id
+    arg = (arg or "").strip().lower()
+    if arg == "clear":
+        snipe_cache.pop(chat_id, None)
+        return await safe_edit(event, "👾 Snipe cache cleared")
+    limit = 1
+    if arg.isdigit(): limit = max(1, min(int(arg), 10))
+    cache = snipe_cache.get(chat_id, [])
+    if not cache: return await safe_edit(event, "👾 No deleted messages yet")
+    lines = []
+    for e in cache[-limit:]:
+        lines.append(f"👾 {e.get('name','?')}\n{e.get('text','')[:250]}")
+    txt = "👾 ꜱɴɪᴘᴇᴅ 👾\n\n" + "\n\n━━━━━━━━━━\n\n".join(lines)
+    if event.out: await safe_edit(event, txt)
+    else: await event.reply(txt)
+
+@register_cmd("edit")
+async def cmd_edit(event, arg):
+    chat_id = event.chat_id
+    limit = 1
+    if arg and arg.strip().isdigit():
+        limit = max(1, min(int(arg.strip()), 10))
+    cache = edit_cache.get(chat_id, [])
+    if not cache: return await safe_edit(event, "👾 No edited messages yet")
+    lines = []
+    for e in cache[-limit:]:
+        lines.append(f"👾 {e.get('name','?')}\n· was: {e.get('old','')[:200]}\n· now: {e.get('new','')[:200]}")
+    txt = "👾 ᴇᴅɪᴛᴇᴅ 👾\n\n" + "\n\n━━━━━━━━━━\n\n".join(lines)
+    if event.out: await safe_edit(event, txt)
+    else: await event.reply(txt)
+
+@register_cmd("seen")
+async def cmd_seen(event, arg):
+    targets = await get_targets(event, arg)
+    if not targets: return await safe_edit(event, "Reply / @user / ID")
+    uid = next(iter(targets))
+    cache = snipe_msgs.get(event.chat_id, {})
+    hits = [v for v in cache.values() if v.get("sender") == uid]
+    if not hits: return await safe_edit(event, "No recent messages from that user")
+    last = max(hits, key=lambda x: x["time"])
+    dt = int(now() - last["time"])
+    txt = (f"👾 ʟᴀꜱᴛ ꜱᴇᴇɴ\n▸ user : {last.get('name', uid)}\n"
+           f"▸ ago  : {human_uptime(dt)}\n▸ text : {last.get('text','')[:300]}")
+    await safe_edit(event, txt)
+
+@register_cmd("dl")
+async def cmd_dl(event, arg):
+    if not arg: return await safe_edit(event, "Use: .dl <url>")
+    url = arg.strip()
+    if not url.startswith(("http://", "https://")): url = "https://" + url
+    await safe_edit(event, "👾 Downloading...")
+    async def dl_task():
+        try:
+            import glob
+            loop = asyncio.get_event_loop()
+            base = os.path.join(str(DL_DIR), f"dl_{event.id}_{int(time.time())}")
+            opts = {
+                "format": "best[filesize<80M]/best",
+                "outtmpl": f"{base}.%(ext)s",
+                "quiet": True, "no_warnings": True,
+                "nocheckcertificate": True, "retries": 5,
+                "noplaylist": False, "ignoreerrors": True,
+                "user_agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/120.0.0.0 Safari/537.36"),
+            }
+            def run():
+                with yt_dlp.YoutubeDL(opts) as ydl: return ydl.extract_info(url, download=True)
+            info = await loop.run_in_executor(None, run)
+            files = [f for f in glob.glob(f"{base}.*") if not f.endswith((".part", ".ytdl"))]
+            if not files: return await safe_edit(event, "👾 Download failed")
+            caption = f"👾 {BRAND} 👾"
+            if isinstance(info, dict):
+                title = info.get("title") or ""
+                if title: caption += f"\n\n{title[:150]}"
+            sent = 0
+            for f in files:
+                try:
+                    await bot.send_file(event.chat_id, f, caption=caption if sent == 0 else "")
+                    sent += 1
+                except Exception: pass
+            for f in files:
+                try: os.remove(f)
+                except Exception: pass
+            await safe_delete(event)
+        except Exception as e:
+            LOG.warning(f"dl: {e}")
+            await safe_edit(event, f"👾 {str(e)[:120]}")
+    asyncio.create_task(dl_task())
+
+@register_cmd("music")
+async def cmd_music(event, arg):
+    if not arg: return await safe_edit(event, "Use: .music <song>")
+    query = arg.strip()
+    await safe_edit(event, f"Searching: {query}")
+    async def dl_task():
+        try:
+            import glob
+            loop = asyncio.get_event_loop()
+            opts = {
+                "format": "bestaudio[abr<=128]/bestaudio",
+                "outtmpl": os.path.join(str(TMP_DIR), "vn_%(id)s.%(ext)s"),
+                "quiet": True, "default_search": "ytsearch1",
+                "noplaylist": True, "retries": 2,
+            }
+            def run():
+                with yt_dlp.YoutubeDL(opts) as ydl: return ydl.extract_info(query, download=True)
+            info = await loop.run_in_executor(None, run)
+            if "entries" in info: info = info["entries"][0]
+            vid = info.get("id"); title = info.get("title") or query
+            dur = info.get("duration") or 0
+            dtext = f"{dur // 60}:{dur % 60:02d}"
+            files = glob.glob(os.path.join(str(TMP_DIR), f"vn_{vid}.*"))
+            if not files: return await safe_edit(event, "Download failed")
+            src = files[0]
+            clean = re.sub(r"[^\w\s-]", "", title).strip()[:40] or "audio"
+            new = os.path.join(str(TMP_DIR), f"{clean}.ogg")
+            try: os.rename(src, new)
+            except Exception: new = src
+            await safe_edit(event, f"Sending: {clean}")
+            await bot.send_file(event.chat_id, new, voice_note=True,
+                                caption=f"Music\n{clean}\n{dtext}")
+            try: os.remove(new)
+            except Exception: pass
+            await safe_delete(event)
+        except Exception as e:
+            LOG.warning(f"music: {e}")
+            await safe_edit(event, f"Music error: {str(e)[:80]}")
+    asyncio.create_task(dl_task())
+
+@register_cmd("voice")
+async def cmd_voice(event, arg):
+    if not arg: return await safe_edit(event, "Use: .voice <text>")
+    await safe_edit(event, "Generating...")
+    fname = os.path.join(str(TMP_DIR), f"voice_{int(time.time())}.mp3")
+    try:
+        gTTS(text=arg[:5000], lang="hi", slow=False).save(fname)
+    except Exception as e:
+        return await safe_edit(event, f"Voice failed: {str(e)[:60]}")
+    try:
+        if event.out:
+            await safe_delete(event)
+            await bot.send_file(event.chat_id, fname, caption=f"👾 {BRAND} 👾")
+        else:
+            await event.reply(file=fname, message=f"👾 {BRAND} 👾")
+    finally:
+        try: os.remove(fname)
+        except Exception: pass
+
+@register_cmd("weather")
+async def cmd_weather(event, arg):
+    if not arg: return await safe_edit(event, "Use: .weather <city>")
+    await safe_edit(event, "Fetching...")
+    try:
+        geo = requests.get(
+            f"https://geocoding-api.open-meteo.com/v1/search?name={arg}&count=1",
+            timeout=8).json()
+    except Exception:
+        return await safe_edit(event, "Geocode failed")
+    if not geo.get("results"): return await safe_edit(event, "City not found")
+    r = geo["results"][0]
+    city = r.get("name"); country = r.get("country", ""); admin = r.get("admin1", "")
+    try:
+        w = requests.get(
+            f"https://api.open-meteo.com/v1/forecast?latitude={r['latitude']}"
+            f"&longitude={r['longitude']}&current_weather=true",
+            timeout=8).json()
+    except Exception:
+        return await safe_edit(event, "Weather fetch failed")
+    cw = w.get("current_weather")
+    if not cw: return await safe_edit(event, "No data")
+    temp = cw.get("temperature"); wind = cw.get("windspeed")
+    code = cw.get("weathercode", 0)
+    cond_map = {
+        0: "Clear Sky",
+        **{c: "Partly Cloudy" for c in (1, 2, 3)},
+        **{c: "Foggy" for c in (45, 48)},
+        **{c: "Drizzle" for c in (51, 53, 55, 56, 57)},
+        **{c: "Rainy" for c in (61, 63, 65, 66, 67)},
+        **{c: "Snowy" for c in (71, 73, 75, 77)},
+        **{c: "Rain Showers" for c in (80, 81, 82)},
+        **{c: "Snow Showers" for c in (85, 86)},
+        **{c: "Thunderstorm" for c in (95, 96, 99)},
+    }
+    cond = cond_map.get(code, "Unknown")
+    loc = city
+    if admin: loc += f", {admin}"
+    if country: loc += f", {country}"
+    txt = (f"👾 weather 👾\n\n▸ location  : {loc}\n▸ condition : {cond}\n"
+           f"▸ temp      : {temp}°C\n▸ wind      : {wind} km/h")
+    if event.out: await safe_edit(event, txt)
+    else: await event.reply(txt)
+
+@register_cmd("copy")
+async def cmd_copy(event, args):
+    global CLONE_DATA, CLONE_ACTIVE, LAST_CLONE_ID
+    reply = await event.get_reply_message()
+    target = None
+    if reply:
+        try:
+            if reply.sender_id: target = await bot.get_entity(reply.sender_id)
+        except Exception: pass
+        if not target and getattr(reply, "fwd_from", None):
+            try:
+                fid = reply.fwd_from.from_id
+                if fid: target = await bot.get_entity(fid)
+            except Exception: pass
+    if not target and args:
+        try: target = await bot.get_entity(args.strip())
+        except Exception: pass
+    if not target: return await safe_edit(event, "Reply / @user / ID")
+    me = await bot.get_me()
+    if target.id == me.id: return await safe_edit(event, "Cannot clone self")
+    if CLONE_ACTIVE and LAST_CLONE_ID == target.id:
+        return await safe_edit(event, "Already cloned")
+    await safe_edit(event, "Cloning...")
+    if not CLONE_ACTIVE:
+        try:
+            full = await bot(GetFullUserRequest(me.id))
+            CLONE_DATA["name"] = me.first_name
+            CLONE_DATA["last"] = me.last_name
+            CLONE_DATA["bio"]  = full.full_user.about
+            try:
+                dp = await bot.download_profile_photo("me", file=bytes, download_big=True)
+                if dp:
+                    b = BytesIO(dp); b.name = "orig.jpg"
+                    CLONE_DATA["photo_bytes"] = b
+                else: CLONE_DATA["photo_bytes"] = None
+            except Exception: CLONE_DATA["photo_bytes"] = None
+            CLONE_ACTIVE = True
+        except Exception: pass
+    try:
+        await bot(UpdateProfileRequest(first_name=target.first_name or "",
+                                       last_name=target.last_name or ""))
+    except FloodWaitError as fw: await asyncio.sleep(fw.seconds + 1)
+    except Exception: pass
+    try:
+        tfull = await bot(GetFullUserRequest(target.id))
+        b = (tfull.full_user.about or "").encode("utf-16", "surrogatepass")\
+                                          .decode("utf-16", "ignore").strip()[:70]
+        await bot(UpdateProfileRequest(about=""))
+        await asyncio.sleep(0.4)
+        await bot(UpdateProfileRequest(about=b))
+    except Exception: pass
+    try:
+        f = await bot.download_profile_photo(target, file=bytes, download_big=True)
+        if f:
+            b = BytesIO(f); b.name = "clone.jpg"
+            up = await bot.upload_file(b)
+            try:
+                cur = await bot.get_profile_photos("me", limit=1)
+                if cur: await bot(DeletePhotosRequest(id=[cur[0]]))
+            except Exception: pass
+            await bot(UploadProfilePhotoRequest(file=up))
+    except FloodWaitError as fw: await asyncio.sleep(fw.seconds + 1)
+    except Exception: pass
+    LAST_CLONE_ID = target.id
+    await safe_edit(event, "Clone complete")
+
+@register_cmd("normal")
+async def cmd_normal(event, _):
+    global CLONE_DATA, CLONE_ACTIVE, LAST_CLONE_ID
+    if not CLONE_ACTIVE: return await safe_edit(event, "No clone active")
+    try:
+        await bot(UpdateProfileRequest(first_name=CLONE_DATA.get("name") or "",
+                                       last_name=CLONE_DATA.get("last") or ""))
+    except Exception: pass
+    try:
+        await bot(UpdateProfileRequest(about=""))
+        await asyncio.sleep(0.4)
+        await bot(UpdateProfileRequest(about=CLONE_DATA.get("bio") or ""))
+    except Exception: pass
+    try:
+        cur = await bot.get_profile_photos("me", limit=1)
+        if cur: await bot(DeletePhotosRequest(id=[cur[0]]))
+        if CLONE_DATA.get("photo_bytes"):
+            b = CLONE_DATA["photo_bytes"]; b.name = "restore.jpg"
+            up = await bot.upload_file(b)
+            await bot(UploadProfilePhotoRequest(file=up))
+    except Exception: pass
+    CLONE_ACTIVE = False; LAST_CLONE_ID = None
+    CLONE_DATA = {"name": None, "last": None, "bio": None, "photo_bytes": None}
+    await safe_edit(event, "Original restored")
+
+@register_cmd("ping")
+async def cmd_ping(event, _):
+    t0 = time.perf_counter()
+    await safe_edit(event, "👾 ping...")
+    t1 = time.perf_counter()
+    await safe_edit(event, f"👾 pong ➤ `{round((t1 - t0) * 1000)} ms`")
+
+@register_cmd("status")
+async def cmd_status(event, _):
+    uptime = max(0, int(now() - START_TIME))
+    local_muted = sum(len(s) for s in muted_users.values())
+    txt = (f"👾 status 👾\n▸ uptime : {human_uptime(uptime)}\n"
+           f"▸ admins : {len(admins)}\n"
+           f"▸ muted  : {local_muted} local / {len(global_muted)} global\n"
+           f"▸ raids  : {len(raid_tasks)}\n▸ sprays : {len(spray_tasks)}\n"
+           f"▸ swipes : {len(swipe_tasks)}\n▸ mode   : operational")
+    await safe_edit(event, txt)
+
+@register_cmd("stats")
+async def cmd_stats(event, _):
+    me = await bot.get_me()
+    uptime = max(0, int(now() - START_TIME))
+    txt = (f"👾 stats 👾\n▸ account : {me.first_name} (@{me.username or 'none'})\n"
+           f"▸ user id : `{me.id}`\n▸ uptime  : {human_uptime(uptime)}\n"
+           f"▸ cmds    : {len(commands)}\n▸ chats   : {len(snipe_msgs)} cached\n"
+           f"▸ snipes  : {sum(len(v) for v in snipe_cache.values())}\n"
+           f"▸ edits   : {sum(len(v) for v in edit_cache.values())}")
+    await safe_edit(event, txt)
+
+@register_cmd("health")
+async def cmd_health(event, _):
+    results = []
+    t0 = time.perf_counter()
+    try:
+        await bot.get_me(); tg = round((time.perf_counter() - t0) * 1000)
+        results.append(f"▸ telegram : `{tg} ms`")
+    except Exception as e:
+        results.append(f"▸ telegram : FAIL ({str(e)[:40]})")
+    try:
+        import yt_dlp as _y
+        results.append(f"▸ yt-dlp   : {_y.version.__version__}")
+    except Exception:
+        results.append("▸ yt-dlp   : FAIL")
+    txt = "👾 health 👾\n" + "\n".join(results)
+    await safe_edit(event, txt)
+
+@register_cmd("backup")
+async def cmd_backup(event, _):
+    try:
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("shadow_state.json",
+                       json.dumps(ST.data, ensure_ascii=False, indent=2))
+        buf.seek(0)
+        buf.name = f"shadow_backup_{int(now())}.zip"
+        await bot.send_file(event.chat_id, buf, caption=f"👾 {BRAND} backup 👾")
+    except Exception as e:
+        await safe_edit(event, f"Backup failed: {str(e)[:80]}")
+
+@register_cmd("restore", needs_reply=True)
+async def cmd_restore(event, _):
+    reply = await event.get_reply_message()
+    if not reply or not reply.media: return await safe_edit(event, "Reply to a backup zip")
+    try:
+        import zipfile
+        raw = await reply.download_media(file=bytes)
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            data = json.loads(z.read("shadow_state.json").decode("utf-8"))
+        ST.data = {**_DEFAULT_STATE, **data}
+        ST.save()
+        global admins, global_muted, group_locks, muted_users
+        global reply_users, rr_users, flag_users, replyshadow_users
+        global menu_banner_msg, auto_react_emoji
+        admins = set(int(x) for x in ST.data.get("admins", []))
+        global_muted = set(int(x) for x in ST.data.get("gmutes", []))
+        group_locks  = set(int(x) for x in ST.data.get("locks", []))
+        muted_users  = {int(k): set(int(u) for u in v)
+                        for k, v in ST.data.get("mutes", {}).items()}
+        reply_users       = set(int(x) for x in ST.data.get("reply_targets", []))
+        rr_users          = set(int(x) for x in ST.data.get("rr_targets", []))
+        flag_users        = set(int(x) for x in ST.data.get("flag_targets", []))
+        replyshadow_users = set(int(x) for x in ST.data.get("shadow_targets", []))
+        menu_banner_msg = tuple(ST.data["banner"]) if ST.data.get("banner") else None
+        auto_react_emoji = ST.data.get("auto_react")
+        await safe_edit(event, "👾 Restored")
+    except Exception as e:
+        await safe_edit(event, f"Restore failed: {str(e)[:80]}")
+
+@register_cmd("reload")
+async def cmd_reload(event, _):
+    ST.load()
+    global admins, global_muted, group_locks, muted_users
+    global reply_users, rr_users, flag_users, replyshadow_users
+    global menu_banner_msg, auto_react_emoji
+    admins = set(int(x) for x in ST.data.get("admins", []))
+    global_muted = set(int(x) for x in ST.data.get("gmutes", []))
+    group_locks  = set(int(x) for x in ST.data.get("locks", []))
+    muted_users  = {int(k): set(int(u) for u in v)
+                    for k, v in ST.data.get("mutes", {}).items()}
+    reply_users       = set(int(x) for x in ST.data.get("reply_targets", []))
+    rr_users          = set(int(x) for x in ST.data.get("rr_targets", []))
+    flag_users        = set(int(x) for x in ST.data.get("flag_targets", []))
+    replyshadow_users = set(int(x) for x in ST.data.get("shadow_targets", []))
+    menu_banner_msg = tuple(ST.data["banner"]) if ST.data.get("banner") else None
+    auto_react_emoji = ST.data.get("auto_react")
+    await safe_edit(event, "👾 Reloaded from disk")
+
+@register_cmd("debug")
+async def cmd_debug(event, arg):
+    arg = (arg or "").strip().lower()
+    if arg not in ("on", "off"):
+        return await safe_edit(event, f"👾 debug is {'on' if ST.data['config'].get('debug') else 'off'}")
+    ST.data["config"]["debug"] = (arg == "on"); ST.save()
+    await safe_edit(event, f"👾 debug {arg}")
+
+@register_cmd("banner", needs_reply=True)
+async def cmd_banner(event, _):
+    global menu_banner_msg
+    reply = await event.get_reply_message()
+    if not reply or not reply.media: return await safe_edit(event, "Reply to a photo/video")
+    await safe_edit(event, "Saving...")
+    try:
+        try: saved = await reply.forward_to("me")
+        except Exception:
+            raw = await reply.download_media(file=bytes)
+            if not raw: return await safe_edit(event, "Download failed")
+            bio = BytesIO(raw); bio.name = "banner"
+            saved = await bot.send_file("me", bio)
+        menu_banner_msg = (saved.chat_id, saved.id); persist()
+        await safe_edit(event, f"Banner set id: {saved.id}")
+    except Exception as e:
+        await safe_edit(event, f"👾 {str(e)[:80]}")
+
+@register_cmd("rembanner")
+async def cmd_rembanner(event, _):
+    global menu_banner_msg
+    if not menu_banner_msg: return await safe_edit(event, "No banner set")
+    c, m = menu_banner_msg
+    try:
+        try: await bot.delete_messages(c, [m])
+        except Exception: pass
+        menu_banner_msg = None; persist()
+        await safe_edit(event, "Banner removed")
+    except Exception as e:
+        await safe_edit(event, f"👾 {str(e)[:80]}")
+
+@register_cmd("stopall")
+async def cmd_stopall(event, _):
+    global auto_react_emoji
+    stopped = []
+    for name, tasks in (("raid", raid_tasks), ("spray", spray_tasks), ("swipe", swipe_tasks)):
+        for c in list(tasks.keys()):
+            try: tasks[c].cancel()
+            except Exception: pass
+            tasks.pop(c, None)
+        if tasks: stopped.append(name)
+    if reply_users:       reply_users.clear();       stopped.append("reply")
+    if rr_users:          rr_users.clear();          stopped.append("rr")
+    if flag_users:        flag_users.clear();        stopped.append("flag")
+    if replyshadow_users: replyshadow_users.clear(); stopped.append("shadow")
+    if auto_react_emoji:  auto_react_emoji = None;   stopped.append("ar")
+    if group_locks:       group_locks.clear();       stopped.append("locks")
+    if muted_users:       muted_users.clear();       stopped.append("mutes")
+    if global_muted:      global_muted.clear();      stopped.append("gmutes")
+    if FASTGC_STATE.get("active"):
+        FASTGC_STATE["active"] = False
+        FASTGC_STATE["template"] = None
+        t = FASTGC_STATE.get("task")
+        if t: t.cancel()
+        FASTGC_STATE["task"] = None
+        stopped.append("fastgc")
+    persist()
+    txt = ("👾 Everything stopped\n" + ", ".join(stopped)) if stopped else "👾 Nothing was active"
+    await safe_edit(event, txt)
+
+@register_cmd("flip")
+async def cmd_flip(event, _):
+    await safe_edit(event, f"👾 flip ➤ {random.choice(['heads', 'tails'])}")
+
+@register_cmd("dice")
+async def cmd_dice(event, _):
+    await safe_edit(event, f"👾 dice ➤ {random.randint(1, 6)}")
+
+@register_cmd("info")
+async def cmd_info(event, arg):
+    target = None
+    if event.is_reply:
+        try:
+            r = await event.get_reply_message()
+            if r and r.sender_id: target = r.sender_id
+        except Exception: pass
+    elif arg:
+        try:
+            ent = await bot.get_entity(arg); target = ent.id
+        except Exception:
+            return await safe_edit(event, "Could not find user")
+    if not target: return await safe_edit(event, "Reply or give @username / id")
+    try:
+        user = await bot.get_entity(target)
+        if getattr(user, "deleted", False): return await safe_edit(event, "Deleted account")
+        full = await bot(GetFullUserRequest(user.id))
+        bio = full.full_user.about or "no bio"
+        un = f"@{user.username}" if getattr(user, "username", None) else "no username"
+        txt = (f"👾 user info\n\n▸ id       ➤ `{user.id}`\n"
+               f"▸ name     ➤ {user.first_name or ''} {user.last_name or ''}\n"
+               f"▸ username ➤ {un}\n▸ bio      ➤ {bio}")
+        await safe_edit(event, txt)
+    except Exception as e:
+        await safe_edit(event, f"Error: {str(e)[:60]}")
+
+
+# ---------- userbot event handlers ----------
+if bot is not None:
+    @bot.on(events.NewMessage)
+    async def on_new_incoming(event):
+        if event.out: return
+        if not event.raw_text: return
+        chat_id = event.chat_id
+        sender = event.sender_id
+        if not sender: return
+        name = str(sender)
+        try:
+            s = await event.get_sender()
+            if s:
+                name = getattr(s, "first_name", None) or getattr(s, "username", None) or str(sender)
+        except Exception: pass
+        snipe_msgs.setdefault(chat_id, {})[event.id] = {
+            "sender": sender, "name": name,
+            "text": event.raw_text, "time": now(),
+        }
+        if len(snipe_msgs[chat_id]) > MSG_CACHE_LIMIT:
+            for old in sorted(snipe_msgs[chat_id].keys())[:60]:
+                snipe_msgs[chat_id].pop(old, None)
+
+    @bot.on(events.MessageDeleted)
+    async def on_message_deleted(event):
+        chat_id = event.chat_id
+        if not chat_id: return
+        snipe_cache.setdefault(chat_id, [])
+        for mid in event.deleted_ids:
+            data = snipe_msgs.get(chat_id, {}).pop(mid, None)
+            if data: snipe_cache[chat_id].append(data)
+        if len(snipe_cache[chat_id]) > SNIPE_LIMIT:
+            snipe_cache[chat_id] = snipe_cache[chat_id][-SNIPE_LIMIT:]
+
+    @bot.on(events.MessageEdited)
+    async def on_message_edited(event):
+        if event.out: return
+        if not event.raw_text: return
+        chat_id = event.chat_id
+        sender = event.sender_id
+        if not sender: return
+        prev = snipe_msgs.get(chat_id, {}).get(event.id)
+        if not prev: return
+        old_text = prev.get("text", "")
+        if old_text == event.raw_text: return
+        name = prev.get("name", str(sender))
+        edit_cache.setdefault(chat_id, []).append({
+            "sender": sender, "name": name,
+            "old": old_text, "new": event.raw_text, "time": now(),
+        })
+        if len(edit_cache[chat_id]) > EDIT_LIMIT:
+            edit_cache[chat_id] = edit_cache[chat_id][-EDIT_LIMIT:]
+        snipe_msgs[chat_id][event.id]["text"] = event.raw_text
+
+    @bot.on(events.NewMessage)
+    async def on_auto_handler(event):
+        if event.out: return
+        sender = event.sender_id
+        chat = event.chat_id
+        if not sender: return
+        if sender == OWNER_ID: return
+        if is_user_muted(chat, sender):
+            await safe_delete(event); return
+        if chat in group_locks and not is_admin(sender):
+            await safe_delete(event); return
+        try:
+            if sender in reply_users:
+                try: await event.reply(random.choice(reply_list))
+                except Exception: pass
+            if sender in replyshadow_users:
+                try:
+                    for _ in range(3):
+                        await event.reply(random.choice(reply_texts))
+                        await asyncio.sleep(0.15)
+                except Exception: pass
+            if sender in flag_users:
+                try: await event.reply(random.choice(flag_texts))
+                except Exception: pass
+            if sender in rr_users:
+                try:
+                    bm = await event.reply(random.choice(fun_texts))
+                    try:
+                        await bot(SendReactionRequest(
+                            peer=chat, msg_id=bm.id,
+                            reaction=[ReactionEmoji(emoticon="👾")]))
+                    except Exception: pass
+                except Exception: pass
+        except Exception: pass
+
+    @bot.on(events.NewMessage(outgoing=True))
+    async def on_auto_react(event):
+        e = auto_react_emoji
+        if not e: return
+        if not event.id or not event.chat_id: return
+        try:
+            await bot(SendReactionRequest(
+                peer=event.chat_id, msg_id=event.id,
+                reaction=[ReactionEmoji(emoticon=e)]))
+        except Exception: pass
+
+    @bot.on(events.NewMessage(outgoing=True))
+    async def on_command(event):
+        text = event.raw_text
+        if not text or not text.startswith("."): return
+        body = text[1:].strip()
+        if not body: return
+        parts = body.split(maxsplit=1)
+        cmd = parts[0].lower().strip()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        meta = commands.get(cmd)
+        if not meta: return
+        if meta["group_only"] and not event.is_group:
+            return await safe_edit(event, "Group only")
+        if meta["needs_reply"] and not event.is_reply and not arg:
+            return await safe_edit(event, f"Reply or argument for .{cmd}")
+        cd = meta["cooldown"] if meta["cooldown"] is not None else ST.data["config"]["cooldown"]
+        if not check_cooldown(event.sender_id or 0, cmd, cd):
+            return
+        await run_with_flood_retry(lambda: meta["func"](event, arg), event, cmd)
+
+
+_shutdown_done = False
+
+async def _graceful_shutdown():
+    global _shutdown_done
+    if _shutdown_done: return
+    _shutdown_done = True
+    LOG.info("shutting down userbot ...")
+    for tmap in (raid_tasks, spray_tasks, swipe_tasks):
+        for c in list(tmap.keys()):
+            try: tmap[c].cancel()
+            except Exception: pass
+            tmap.pop(c, None)
+    t = FASTGC_STATE.get("task")
+    if t: t.cancel()
+    persist()
+    try:
+        if bot and bot.is_connected(): await bot.disconnect()
+    except Exception: pass
+
+
+async def userbot_main():
+    if not bot:
+        print("missing SHADOW_API_ID / SHADOW_API_HASH env")
+        return
+    try:
+        await bot.start(phone=PHONE)
+        me = await bot.get_me()
+        un = f"@{me.username}" if me.username else "NoUsername"
+        print("=" * 44)
+        print(f"  👾  {BRAND}  👾")
+        print(f"  logged in : {me.first_name} ({un})")
+        print(f"  user id   : {me.id}")
+        print(f"  session   : {SESSION}.session")
+        print("=" * 44)
+        LOG.info(f"userbot online · {len(commands)} commands")
+        try:
+            await bot.run_until_disconnected()
+        except (ConnectionError, OSError) as e:
+            LOG.warning(f"connection dropped: {e}")
+    except KeyboardInterrupt:
+        LOG.info("interrupted")
+    except Exception as e:
+        LOG.error(f"startup error: {e}\n{traceback.format_exc()}")
+    finally:
+        await _graceful_shutdown()
+
+
+# ==================================================================
+# ==================================================================
+#  SECTION 2 — ONBOARDING BOT  (admin-approval gate)
+# ==================================================================
+# ==================================================================
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CallbackQueryHandler, CommandHandler,
+    ContextTypes, ConversationHandler, MessageHandler, filters,
+)
+
+CODE_LEN = 5
+ASK_API_ID, ASK_API_HASH, ASK_PHONE, ASK_CODE, ASK_PASSWORD = range(5)
+
+# ---- approval gate ----
+ADMIN_ID       = 8846085944
+APPROVAL_FILE  = BASE_DIR / "approved_users.json"
+PENDING_FILE   = BASE_DIR / "pending_users.json"
+
+
+def _load_id_set(path: Path) -> set:
+    try:
+        return set(int(x) for x in json.loads(path.read_text(encoding="utf-8")))
+    except Exception:
+        return set()
+
+
+def _save_id_set(path: Path, s: set) -> None:
+    try:
+        path.write_text(json.dumps(sorted(int(x) for x in s)), encoding="utf-8")
+    except Exception as e:
+        print(f"save {path.name} failed: {e}")
+
+
+APPROVED_USERS: set = _load_id_set(APPROVAL_FILE)
+PENDING_USERS:  set = _load_id_set(PENDING_FILE)
+APPROVED_USERS.add(ADMIN_ID)   # admin is always pre-approved
+# ---- end approval gate ----
+
+_onboard_state: dict[int, dict] = {}
+_running: dict[int, dict] = {}
+
+
+def _cfg_path(chat_id: int) -> Path:
+    return USERS_DIR / f"user_{chat_id}.json"
+
+def _session_path(chat_id: int) -> Path:
+    return SESS_DIR / f"session_{chat_id}"
+
+
+async def _track(bot_app, chat_id: int, text: str, **kw):
+    m = await bot_app.send_message(chat_id, text, **kw)
+    st = _onboard_state.setdefault(chat_id, {"bot_msg_ids": []})
+    st.setdefault("bot_msg_ids", []).append(m.message_id)
+    return m
+
+
+async def _wipe_tracked(bot_app, chat_id: int, st: dict):
+    ids = list(st.get("bot_msg_ids") or [])
+    st["bot_msg_ids"] = []
+    for mid in ids:
+        try: await bot_app.delete_message(chat_id, mid)
+        except Exception: pass
+
+
+async def _kill_running(chat_id: int, do_logout: bool = True):
+    r = _running.pop(chat_id, None)
+    if not r: return
+    proc = r.get("proc")
+    if proc and proc.poll() is None:
+        try: proc.terminate()
+        except Exception: pass
+        try: proc.wait(timeout=5)
+        except Exception:
+            try: proc.kill()
+            except Exception: pass
+    if do_logout:
+        await asyncio.sleep(0.5)
+        await _logout_via_session(chat_id)
+
+
+async def _logout_via_session(chat_id: int):
+    cfg_file = _cfg_path(chat_id)
+    if not cfg_file.exists(): return
+    try:
+        cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    try:
+        c = TelegramClient(cfg["session"], int(cfg["api_id"]), cfg["api_hash"])
+        await c.connect()
+        if await c.is_user_authorized():
+            try: await c.log_out()
+            except Exception:
+                try: await c.disconnect()
+                except Exception: pass
+        else:
+            try: await c.disconnect()
+            except Exception: pass
+    except Exception:
+        pass
+
+
+async def _close_telethon(chat_id: int):
+    st = _onboard_state.get(chat_id)
+    if not st: return
+    c = st.get("client")
+    if c:
+        try: await c.disconnect()
+        except Exception: pass
+        st["client"] = None
+
+
+# ---- /start (gated) ----
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user    = update.effective_user
+
+    # ---- approval gate ----
+    if chat_id != ADMIN_ID and chat_id not in APPROVED_USERS:
+        if chat_id not in PENDING_USERS:
+            PENDING_USERS.add(chat_id)
+            _save_id_set(PENDING_FILE, PENDING_USERS)
+
+            name  = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip() or "unknown"
+            uname = f"@{user.username}" if user.username else "no username"
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data=f"appr:{chat_id}"),
+                InlineKeyboardButton("❌ Reject",  callback_data=f"rej:{chat_id}"),
+            ]])
+            try:
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    "🔔 ɴᴇᴡ ᴀᴄᴄᴇꜱꜱ ʀᴇQᴜᴇꜱᴛ\n\n"
+                    f"▸ name     : {name}\n"
+                    f"▸ username : {uname}\n"
+                    f"▸ user id  : `{chat_id}`",
+                    reply_markup=kb,
+                )
+            except Exception as e:
+                print(f"admin notify failed: {e}")
+
+        await context.bot.send_message(
+            chat_id,
+            "⏳ Aapki request admin ko bhej di gayi hai.\n"
+            "Approve hone ke baad /start dobara bhejein.",
+        )
+        return ConversationHandler.END
+    # ---- end gate ----
+
+    await _kill_running(chat_id, do_logout=True)
+    await _close_telethon(chat_id)
+    _onboard_state[chat_id] = {"bot_msg_ids": []}
+    await _track(
+        context.bot, chat_id,
+        "Welcome.\n\nStep 1/4 — API ID\n\n"
+        "Get API ID and API Hash from https://my.telegram.org/apps\n"
+        "Login, open 'API development tools', copy the numbers.\n\n"
+        "Send your API ID (numbers only).",
+    )
+    return ASK_API_ID
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    st = _onboard_state.pop(chat_id, None) or {}
+    await _close_telethon(chat_id)
+    try: await _wipe_tracked(context.bot, chat_id, st)
+    except Exception: pass
+    await context.bot.send_message(chat_id, "Cancelled. Send /start to begin again.")
+    return ConversationHandler.END
+
+
+async def got_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    try: await update.message.delete()
+    except Exception: pass
+    txt = (update.message.text or "").strip()
+    if not txt.isdigit() or not (5 <= len(txt) <= 12):
+        await _track(context.bot, chat_id, "API ID must be numeric. Send again.")
+        return ASK_API_ID
+    st = _onboard_state.setdefault(chat_id, {"bot_msg_ids": []})
+    st["api_id"] = int(txt)
+    await _track(context.bot, chat_id,
+                 "Saved.\n\nStep 2/4 — API Hash\n\nSend your 32-character API Hash.")
+    return ASK_API_HASH
+
+
+async def got_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    try: await update.message.delete()
+    except Exception: pass
+    txt = (update.message.text or "").strip()
+    if len(txt) != 32 or any(c not in "0123456789abcdefABCDEF" for c in txt):
+        await _track(context.bot, chat_id, "API Hash must be 32 hex characters. Send again.")
+        return ASK_API_HASH
+    st = _onboard_state.setdefault(chat_id, {"bot_msg_ids": []})
+    st["api_hash"] = txt
+    await _track(context.bot, chat_id,
+                 "Saved.\n\nStep 3/4 — Phone number\n\n"
+                 "Send in international format with leading +.\n"
+                 "Example: +919999999999")
+    return ASK_PHONE
+
+
+async def got_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    try: await update.message.delete()
+    except Exception: pass
+    raw = (update.message.text or "").strip().replace(" ", "").replace("-", "")
+    if not (raw.startswith("+") and raw[1:].isdigit() and 7 <= len(raw) <= 16):
+        await _track(context.bot, chat_id, "Invalid. Send like +919999999999")
+        return ASK_PHONE
+    st = _onboard_state.setdefault(chat_id, {"bot_msg_ids": []})
+    api_id, api_hash = st.get("api_id"), st.get("api_hash")
+    if not api_id or not api_hash:
+        await _track(context.bot, chat_id, "Session lost. Send /start.")
+        return ConversationHandler.END
+    await _track(context.bot, chat_id, "Connecting to Telegram ...")
+    client = TelegramClient(str(_session_path(chat_id)), api_id, api_hash)
+    try:
+        await client.connect()
+    except Exception as e:
+        await _track(context.bot, chat_id, f"Connect failed: {e}")
+        return ConversationHandler.END
+    if await client.is_user_authorized():
+        st["client"] = client
+        st["phone"]  = raw
+        return await _finalize(update, context, chat_id)
+    try:
+        sent = await client.send_code_request(raw)
+    except FloodWaitError as fw:
+        await _track(context.bot, chat_id, f"Telegram flood-wait {fw.seconds}s. Try /start later.")
+        try: await client.disconnect()
+        except Exception: pass
+        return ConversationHandler.END
+    except ApiIdInvalidError:
+        await _track(context.bot, chat_id, "API ID / Hash rejected by Telegram. Send /start.")
+        try: await client.disconnect()
+        except Exception: pass
+        return ConversationHandler.END
+    except Exception as e:
+        await _track(context.bot, chat_id, f"send_code_request failed: {e}")
+        try: await client.disconnect()
+        except Exception: pass
+        return ConversationHandler.END
+    st["client"] = client
+    st["phone"]  = raw
+    st["hash"]   = sent.phone_code_hash
+    st["digits"] = []
+    await _track(
+        context.bot, chat_id,
+        "Code sent to your Telegram app.\n\n"
+        "Step 4/4 — Enter the 5-digit code, ONE DIGIT AT A TIME.\n"
+        "Example: send `1`, then `2`, then `3`, then `4`, then `5`.\n"
+        "The bot joins them into 12345 on its own.\n\n"
+        "digit 1/5 :",
+    )
+    return ASK_CODE
+
+
+async def got_code_digit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    try: await update.message.delete()
+    except Exception: pass
+    st = _onboard_state.get(chat_id)
+    if not st or not st.get("client"):
+        await context.bot.send_message(chat_id, "Session lost. Send /start.")
+        return ConversationHandler.END
+    txt = (update.message.text or "").strip()
+    digits_in = [c for c in txt if c.isdigit()]
+    if not digits_in:
+        await _track(context.bot, chat_id,
+                     f"Send a digit (0-9). digit {len(st['digits'])+1}/{CODE_LEN} :")
+        return ASK_CODE
+    st["digits"].extend(digits_in)
+    if len(st["digits"]) > CODE_LEN:
+        st["digits"] = st["digits"][:CODE_LEN]
+    if len(st["digits"]) < CODE_LEN:
+        await _track(context.bot, chat_id, f"digit {len(st['digits'])+1}/{CODE_LEN} :")
+        return ASK_CODE
+    code = "".join(st["digits"])
+    client = st["client"]
+    try:
+        await client.sign_in(phone=st["phone"], code=code, phone_code_hash=st["hash"])
+    except SessionPasswordNeededError:
+        st["digits"] = []
+        await _track(context.bot, chat_id,
+                     "2FA password required.\n\nSend your cloud password now.\n"
+                     "The message you send will be deleted automatically.")
+        return ASK_PASSWORD
+    except PhoneCodeInvalidError:
+        st["digits"] = []
+        await _track(context.bot, chat_id, "Invalid code. Restarting entry.\ndigit 1/5 :")
+        return ASK_CODE
+    except PhoneCodeExpiredError:
+        st["digits"] = []
+        try:
+            sent = await client.send_code_request(st["phone"])
+            st["hash"] = sent.phone_code_hash
+        except Exception as e:
+            await _track(context.bot, chat_id, f"Resend failed: {e}")
+            return ConversationHandler.END
+        await _track(context.bot, chat_id, "Code expired. A new code was sent.\ndigit 1/5 :")
+        return ASK_CODE
+    except FloodWaitError as fw:
+        await _track(context.bot, chat_id, f"Flood-wait {fw.seconds}s during sign-in.")
+        return ConversationHandler.END
+    except Exception as e:
+        await _track(context.bot, chat_id, f"sign_in failed: {e}")
+        return ConversationHandler.END
+    return await _finalize(update, context, chat_id)
+
+
+async def got_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    try: await update.message.delete()
+    except Exception: pass
+    st = _onboard_state.get(chat_id)
+    if not st or not st.get("client"):
+        return ConversationHandler.END
+    client = st["client"]
+    pwd = (update.message.text or "").strip()
+    try:
+        await client.sign_in(password=pwd)
+    except PasswordHashInvalidError:
+        await _track(context.bot, chat_id, "Wrong password. Try again.")
+        return ASK_PASSWORD
+    except FloodWaitError as fw:
+        await _track(context.bot, chat_id, f"Flood-wait {fw.seconds}s.")
+        return ConversationHandler.END
+    except Exception as e:
+        await _track(context.bot, chat_id, f"2FA failed: {e}")
+        return ConversationHandler.END
+    return await _finalize(update, context, chat_id)
+
+
+async def _finalize(update, context, chat_id: int):
+    st = _onboard_state.get(chat_id) or {}
+    client = st.get("client")
+    if client is None:
+        return ConversationHandler.END
+    me = await client.get_me()
+    cfg = {
+        "api_id":   st["api_id"],
+        "api_hash": st["api_hash"],
+        "phone":    st["phone"],
+        "user_id":  me.id,
+        "session":  str(_session_path(chat_id)),
+        "state":    str(_state_path_for(chat_id)),
+    }
+    cp = _cfg_path(chat_id)
+    cp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+    # wipe the private chat with the bot using the user's own account
+    bot_me = await context.bot.get_me()
+    await asyncio.sleep(0.4)
+    try:
+        ids = []
+        async for m in client.iter_messages(bot_me.id, limit=200):
+            ids.append(m.id)
+        for i in range(0, len(ids), 80):
+            try: await client.delete_messages(bot_me.id, ids[i:i + 80])
+            except Exception: pass
+            await asyncio.sleep(0.2)
+    except Exception:
+        pass
+
+    # disconnect so subprocess can own the session file
+    try: await client.disconnect()
+    except Exception: pass
+    st["client"] = None
+
+    # spawn the userbot subprocess
+    env = os.environ.copy()
+    env["SHADOW_API_ID"]   = str(cfg["api_id"])
+    env["SHADOW_API_HASH"] = cfg["api_hash"]
+    env["SHADOW_OWNER_ID"] = str(cfg["user_id"])
+    env["SHADOW_PHONE"]    = cfg["phone"]
+    env["SHADOW_SESSION"]  = cfg["session"]
+    env["SHADOW_STATE"]    = cfg["state"]
+
+    proc = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "--userbot", str(chat_id)],
+        cwd=str(BASE_DIR),
+        env=env,
+    )
+    _running[chat_id] = {"proc": proc, "config": str(cp), "user_id": me.id}
+
+    # sweep any tracked messages that survived
+    try: await _wipe_tracked(context.bot, chat_id, st)
+    except Exception: pass
+
+    # final message with logout button
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Click here for successfully logout", callback_data="logout")]]
+    )
+    await context.bot.send_message(
+        chat_id,
+        "✅ Login successful.\n\n"
+        "Your userbot is now running 24/7.\n"
+        "All commands are live — try `.menu` in any chat.\n\n"
+        "Thanks for using this service.\n\n"
+        "Press the button below to log out completely at any time.",
+        reply_markup=kb,
+    )
+    st["finalized"] = True
+    return ConversationHandler.END
+
+
+def _state_path_for(chat_id: int) -> Path:
+    return RUN_DIR / f"state_{chat_id}.json"
+
+
+# ---- approval callbacks ----
+async def approval_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    if q.from_user.id != ADMIN_ID:
+        return
+
+    try:
+        action, uid_s = q.data.split(":", 1)
+        uid = int(uid_s)
+    except Exception:
+        return
+
+    if action == "appr":
+        APPROVED_USERS.add(uid)
+        _save_id_set(APPROVAL_FILE, APPROVED_USERS)
+        PENDING_USERS.discard(uid)
+        _save_id_set(PENDING_FILE, PENDING_USERS)
+        try:
+            await q.edit_message_text(f"✅ ᴀᴘᴘʀᴏᴠᴇᴅ  ·  `{uid}`", parse_mode="Markdown")
+        except Exception: pass
+        try:
+            await context.bot.send_message(
+                uid,
+                "✅ Aapko approve kar diya gaya hai.\n"
+                "Ab /start bhejein shuru karne ke liye.",
+            )
+        except Exception:
+            pass
+
+    elif action == "rej":
+        PENDING_USERS.discard(uid)
+        _save_id_set(PENDING_FILE, PENDING_USERS)
+        APPROVED_USERS.discard(uid)
+        _save_id_set(APPROVAL_FILE, APPROVED_USERS)
+        try:
+            await q.edit_message_text(f"❌ ʀᴇᴊᴇᴄᴛᴇᴅ  ·  `{uid}`", parse_mode="Markdown")
+        except Exception: pass
+        try:
+            await context.bot.send_message(uid, "❌ Aapki request reject kar di gayi hai.")
+        except Exception:
+            pass
+
+
+# ---- logout button ----
+async def logout_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    chat_id = q.message.chat_id
+
+    await _kill_running(chat_id, do_logout=True)
+
+    for p in SESS_DIR.glob(f"session_{chat_id}*"):
+        try: p.unlink()
+        except Exception: pass
+    cp = _cfg_path(chat_id)
+    if cp.exists():
+        try: cp.unlink()
+        except Exception: pass
+    sp = _state_path_for(chat_id)
+    if sp.exists():
+        try: sp.unlink()
+        except Exception: pass
+
+    try:
+        for mid in range(q.message.message_id, max(0, q.message.message_id - 60), -1):
+            try: await context.bot.delete_message(chat_id, mid)
+            except Exception: pass
+    except Exception:
+        pass
+
+    await context.bot.send_message(
+        chat_id,
+        "👋 Logged out successfully.\n"
+        "All sessions and data removed.\n"
+        "Send /start to begin again.",
+    )
+    return ConversationHandler.END
+
+
+# ---- onboarding bot main ----
+def bot_main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # approval buttons must be registered before the logout handler
+    app.add_handler(CallbackQueryHandler(approval_cb, pattern=r"^(appr|rej):"))
+    app.add_handler(CallbackQueryHandler(logout_cb,   pattern=r"^logout$"))
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", cmd_start)],
+        states={
+            ASK_API_ID:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_api_id)],
+            ASK_API_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_api_hash)],
+            ASK_PHONE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, got_phone)],
+            ASK_CODE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, got_code_digit)],
+            ASK_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_password)],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        per_message=False,
+        allow_reentry=True,
+    )
+    app.add_handler(conv)
+
+    print("onboarding bot online — /start in telegram")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+# ==================================================================
+#  DISPATCH
+# ==================================================================
+if __name__ == "__main__":
+    if IS_USERBOT:
+        try:
+            signal.signal(signal.SIGINT,  lambda *_: None)
+            signal.signal(signal.SIGTERM, lambda *_: None)
+        except Exception:
+            pass
+        atexit.register(lambda: persist())
+        try:
+            asyncio.run(userbot_main())
+        except KeyboardInterrupt:
+            pass
+    else:
+        atexit.register(lambda: persist())
+        bot_main()
