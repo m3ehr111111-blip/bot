@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # language: Python 3.10+
 # file: shadow_all.py
-# target: Windows cmd / Linux / Termux / Railway worker
+# target: Windows cmd / Linux / Termux
 # deps: pip install "python-telegram-bot>=21" telethon yt-dlp gTTS requests
 #
 # MODE A (default):  python shadow_all.py
-#   -> runs the onboarding bot (token below). /start is gated by ADMIN_ID
-#      approval. Once approved, /start collects API ID, API Hash, phone,
-#      OTP digit-by-digit, 2FA password. On success, wipes chat, spawns
+#   -> runs the onboarding bot (token below). /start collects API ID, API Hash,
+#      phone, OTP digit-by-digit, 2FA password. On success, wipes chat, spawns
 #      this same file as MODE B with per-user env, sends final thanks + logout.
 #
 # MODE B (auto-spawned):  python shadow_all.py --userbot <chat_id>
@@ -100,7 +99,7 @@ except Exception as e:
 
 # ==================================================================
 # ==================================================================
-#  SECTION 1 — USERBOT  (env-driven)
+#  SECTION 1 — USERBOT  (shadow2.py, env-driven)
 # ==================================================================
 # ==================================================================
 
@@ -134,6 +133,7 @@ _DEFAULT_STATE = {
     "flag_targets":   [],
     "shadow_targets": [],
     "auto_react":   None,
+    "auto_clear_titles": False,
     "config": {
         "spray_delay": 0.25,
         "raid_delay":  0.25,
@@ -489,6 +489,7 @@ MENU_TEXT = f"""
 ┃ 👾 .ping / .status / .stats / .health
 ┃ 👾 .backup / .restore / .reload
 ┃ 👾 .debug on/off / .stopall
+┃ 👾 .clear on/off » auto nuke title msgs
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐅𝐔𝐍 ━━━━━━━╮
@@ -1512,6 +1513,22 @@ async def cmd_stopall(event, _):
     txt = ("👾 Everything stopped\n" + ", ".join(stopped)) if stopped else "👾 Nothing was active"
     await safe_edit(event, txt)
 
+@register_cmd("clear")
+async def cmd_clear(event, arg):
+    arg = (arg or "").strip().lower()
+    if arg in ("on", "off"):
+        state = (arg == "on")
+    else:
+        state = not ST.data.get("auto_clear_titles", False)
+    ST.data["auto_clear_titles"] = state
+    ST.save()
+    await safe_edit(
+        event,
+        f"👾 auto-clear service msgs ➤ {'ON' if state else 'OFF'}\n"
+        f"▸ scope: chat title + photo change notifications\n"
+        f"▸ mode : instant delete via raw update hook",
+    )
+
 @register_cmd("flip")
 async def cmd_flip(event, _):
     await safe_edit(event, f"👾 flip ➤ {random.choice(['heads', 'tails'])}")
@@ -1648,6 +1665,43 @@ if bot is not None:
                 reaction=[ReactionEmoji(emoticon=e)]))
         except Exception: pass
 
+    # ---------- auto-nuke title/photo service messages ----------
+    async def _nuke_service(peer_id, msg_id, delay: float = 0.0):
+        if delay > 0:
+            await asyncio.sleep(delay)
+        try:
+            await bot.delete_messages(peer_id, [msg_id])
+        except FloodWaitError as fw:
+            # re-arm once with the flood delay
+            asyncio.create_task(_nuke_service(peer_id, msg_id, fw.seconds + 0.5))
+        except Exception:
+            pass
+
+    _SERVICE_ACTIONS = (
+        types.MessageActionChatEditTitle,
+        types.MessageActionChatEditPhoto,
+        types.MessageActionChatDeletePhoto,
+        types.MessageActionChannelCreate,
+    )
+
+    @bot.on(events.Raw(types=[
+        types.UpdateNewChannelMessage,
+        types.UpdateNewMessage,
+        types.UpdateEditChannelMessage,
+        types.UpdateEditMessage,
+    ]))
+    async def on_service_clear(event):
+        if not ST.data.get("auto_clear_titles"):
+            return
+        msg = getattr(event, "message", None)
+        if not isinstance(msg, types.MessageService):
+            return
+        action = getattr(msg, "action", None)
+        if not isinstance(action, _SERVICE_ACTIONS):
+            return
+        # fire-and-forget so a rename storm doesn't block the update loop
+        asyncio.create_task(_nuke_service(msg.peer_id, msg.id))
+
     @bot.on(events.NewMessage(outgoing=True))
     async def on_command(event):
         text = event.raw_text
@@ -1718,7 +1772,7 @@ async def userbot_main():
 
 # ==================================================================
 # ==================================================================
-#  SECTION 2 — ONBOARDING BOT  (admin-approval gate)
+#  SECTION 2 — ONBOARDING BOT
 # ==================================================================
 # ==================================================================
 
@@ -1730,31 +1784,6 @@ from telegram.ext import (
 
 CODE_LEN = 5
 ASK_API_ID, ASK_API_HASH, ASK_PHONE, ASK_CODE, ASK_PASSWORD = range(5)
-
-# ---- approval gate ----
-ADMIN_ID       = 8846085944
-APPROVAL_FILE  = BASE_DIR / "approved_users.json"
-PENDING_FILE   = BASE_DIR / "pending_users.json"
-
-
-def _load_id_set(path: Path) -> set:
-    try:
-        return set(int(x) for x in json.loads(path.read_text(encoding="utf-8")))
-    except Exception:
-        return set()
-
-
-def _save_id_set(path: Path, s: set) -> None:
-    try:
-        path.write_text(json.dumps(sorted(int(x) for x in s)), encoding="utf-8")
-    except Exception as e:
-        print(f"save {path.name} failed: {e}")
-
-
-APPROVED_USERS: set = _load_id_set(APPROVAL_FILE)
-PENDING_USERS:  set = _load_id_set(PENDING_FILE)
-APPROVED_USERS.add(ADMIN_ID)   # admin is always pre-approved
-# ---- end approval gate ----
 
 _onboard_state: dict[int, dict] = {}
 _running: dict[int, dict] = {}
@@ -1830,43 +1859,9 @@ async def _close_telethon(chat_id: int):
         st["client"] = None
 
 
-# ---- /start (gated) ----
+# ---- /start ----
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user    = update.effective_user
-
-    # ---- approval gate ----
-    if chat_id != ADMIN_ID and chat_id not in APPROVED_USERS:
-        if chat_id not in PENDING_USERS:
-            PENDING_USERS.add(chat_id)
-            _save_id_set(PENDING_FILE, PENDING_USERS)
-
-            name  = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip() or "unknown"
-            uname = f"@{user.username}" if user.username else "no username"
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Approve", callback_data=f"appr:{chat_id}"),
-                InlineKeyboardButton("❌ Reject",  callback_data=f"rej:{chat_id}"),
-            ]])
-            try:
-                await context.bot.send_message(
-                    ADMIN_ID,
-                    "🔔 ɴᴇᴡ ᴀᴄᴄᴇꜱꜱ ʀᴇQᴜᴇꜱᴛ\n\n"
-                    f"▸ name     : {name}\n"
-                    f"▸ username : {uname}\n"
-                    f"▸ user id  : `{chat_id}`",
-                    reply_markup=kb,
-                )
-            except Exception as e:
-                print(f"admin notify failed: {e}")
-
-        await context.bot.send_message(
-            chat_id,
-            "⏳ Aapki request admin ko bhej di gayi hai.\n"
-            "Approve hone ke baad /start dobara bhejein.",
-        )
-        return ConversationHandler.END
-    # ---- end gate ----
-
     await _kill_running(chat_id, do_logout=True)
     await _close_telethon(chat_id)
     _onboard_state[chat_id] = {"bot_msg_ids": []}
@@ -2131,51 +2126,6 @@ def _state_path_for(chat_id: int) -> Path:
     return RUN_DIR / f"state_{chat_id}.json"
 
 
-# ---- approval callbacks ----
-async def approval_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    if q.from_user.id != ADMIN_ID:
-        return
-
-    try:
-        action, uid_s = q.data.split(":", 1)
-        uid = int(uid_s)
-    except Exception:
-        return
-
-    if action == "appr":
-        APPROVED_USERS.add(uid)
-        _save_id_set(APPROVAL_FILE, APPROVED_USERS)
-        PENDING_USERS.discard(uid)
-        _save_id_set(PENDING_FILE, PENDING_USERS)
-        try:
-            await q.edit_message_text(f"✅ ᴀᴘᴘʀᴏᴠᴇᴅ  ·  `{uid}`", parse_mode="Markdown")
-        except Exception: pass
-        try:
-            await context.bot.send_message(
-                uid,
-                "✅ Aapko approve kar diya gaya hai.\n"
-                "Ab /start bhejein shuru karne ke liye.",
-            )
-        except Exception:
-            pass
-
-    elif action == "rej":
-        PENDING_USERS.discard(uid)
-        _save_id_set(PENDING_FILE, PENDING_USERS)
-        APPROVED_USERS.discard(uid)
-        _save_id_set(APPROVAL_FILE, APPROVED_USERS)
-        try:
-            await q.edit_message_text(f"❌ ʀᴇᴊᴇᴄᴛᴇᴅ  ·  `{uid}`", parse_mode="Markdown")
-        except Exception: pass
-        try:
-            await context.bot.send_message(uid, "❌ Aapki request reject kar di gayi hai.")
-        except Exception:
-            pass
-
-
 # ---- logout button ----
 async def logout_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2215,11 +2165,6 @@ async def logout_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---- onboarding bot main ----
 def bot_main():
     app = Application.builder().token(BOT_TOKEN).build()
-
-    # approval buttons must be registered before the logout handler
-    app.add_handler(CallbackQueryHandler(approval_cb, pattern=r"^(appr|rej):"))
-    app.add_handler(CallbackQueryHandler(logout_cb,   pattern=r"^logout$"))
-
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={
@@ -2234,7 +2179,7 @@ def bot_main():
         allow_reentry=True,
     )
     app.add_handler(conv)
-
+    app.add_handler(CallbackQueryHandler(logout_cb, pattern="^logout$"))
     print("onboarding bot online — /start in telegram")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
