@@ -4,14 +4,14 @@
 # target: Windows cmd / Linux / Termux
 # deps: pip install "python-telegram-bot>=21" telethon yt-dlp gTTS requests
 #
-# MODE A (default):  python shadow_all.py
-#   -> runs the onboarding bot (token below). /start collects API ID, API Hash,
-#      phone, OTP digit-by-digit, 2FA password. On success, wipes chat, spawns
-#      this same file as MODE B with per-user env, sends final thanks + logout.
+# MODE A:  python shadow_all.py            → onboarding bot
+# MODE B:  python shadow_all.py --userbot <chat_id>   → userbot
 #
-# MODE B (auto-spawned):  python shadow_all.py --userbot <chat_id>
-#   -> runs the userbot (all the .raid .spray .menu commands) using the
-#      session/state/config that MODE A wrote to users/user_<chat_id>.json.
+# v3.1 fixes:
+#   • YouTube bot-check bypass (extractor_args android/ios/web_safari)
+#   • Optional cookies.txt support (drop in BASE_DIR)
+#   • Own SHADOW bots' NC never deleted
+#   • Other bots/users service msgs deleted instantly (batched)
 
 import asyncio
 import atexit
@@ -65,7 +65,7 @@ if not LOG.handlers:
 IS_USERBOT = "--userbot" in sys.argv
 
 # ------------------------------------------------------------------
-#  shared imports (only userbot side actually uses these)
+#  deps
 # ------------------------------------------------------------------
 try:
     import requests
@@ -98,9 +98,7 @@ except Exception as e:
 
 
 # ==================================================================
-# ==================================================================
-#  SECTION 1 — USERBOT  (shadow2.py, env-driven)
-# ==================================================================
+#  SECTION 1 — USERBOT
 # ==================================================================
 
 API_ID    = int(os.environ.get("SHADOW_API_ID",   "0"))
@@ -133,7 +131,8 @@ _DEFAULT_STATE = {
     "flag_targets":   [],
     "shadow_targets": [],
     "auto_react":   None,
-    "auto_clear_titles": False,
+    "auto_clear_titles":   False,
+    "auto_clear_bot_msgs": False,
     "config": {
         "spray_delay": 0.25,
         "raid_delay":  0.25,
@@ -189,6 +188,15 @@ replyshadow_users: Set[int]= set(int(x) for x in ST.data.get("shadow_targets", [
 menu_banner_msg: Optional[tuple] = tuple(ST.data["banner"]) if ST.data.get("banner") else None
 auto_react_emoji: Optional[str]  = ST.data.get("auto_react")
 
+OUR_BOT_USERNAMES: Set[str] = set(ADD_BOTS_LIST)
+_our_bot_ids_cache: Set[int] = set()
+_our_bot_cache_loaded = False
+_my_userbot_id: Optional[int] = None
+
+_nuke_queue: "asyncio.Queue" = asyncio.Queue()
+_NUKE_BATCH_MAX   = 100
+_NUKE_BATCH_WAIT  = 0.03
+
 
 def persist():
     ST.data["admins"]         = sorted(admins)
@@ -204,7 +212,6 @@ def persist():
     ST.save()
 
 
-# ---------- client (only used in userbot mode) ----------
 if API_ID and API_HASH:
     bot = TelegramClient(
         SESSION, API_ID, API_HASH,
@@ -301,6 +308,32 @@ flag_texts = [
 ]
 
 
+# ---------- yt-dlp YouTube bypass ----------
+def _ydl_youtube_opts(base: dict) -> dict:
+    """Add YouTube bot-check bypass options to yt-dlp opts dict."""
+    opts = dict(base)
+    # player clients — android/ios/web_safari bypass most bot checks
+    ea = opts.setdefault("extractor_args", {})
+    ea["youtube"] = {
+        "player_client": ["android", "web_safari", "ios", "web"],
+        "player_skip": ["webpage", "configs"],
+    }
+    # optional cookies.txt drop-in (export from browser extension)
+    ck = BASE_DIR / "cookies.txt"
+    if ck.exists():
+        opts["cookiefile"] = str(ck)
+    # cookiesfrombrowser fallback (only if user opted in)
+    cf = BASE_DIR / "cookies_from_browser.txt"
+    if cf.exists():
+        try:
+            br = cf.read_text(encoding="utf-8").strip().lower()
+            if br in ("chrome", "edge", "firefox", "brave", "opera", "chromium"):
+                opts["cookiesfrombrowser"] = (br,)
+        except Exception:
+            pass
+    return opts
+
+
 # ---------- helpers ----------
 def now() -> float: return time.time()
 
@@ -311,6 +344,79 @@ def is_admin(uid: Optional[int]) -> bool:
 def is_user_muted(chat_id: int, user_id: int) -> bool:
     if user_id in global_muted: return True
     return chat_id in muted_users and user_id in muted_users[chat_id]
+
+
+def _extract_user_id(msg) -> Optional[int]:
+    try:
+        fid = getattr(msg, "from_id", None)
+        if fid is not None:
+            uid = getattr(fid, "user_id", None)
+            if uid: return int(uid)
+            cid = getattr(fid, "channel_id", None)
+            if cid: return -int(cid)
+        pid = getattr(msg, "peer_id", None)
+        if pid is not None:
+            uid = getattr(pid, "user_id", None)
+            if uid: return int(uid)
+    except Exception:
+        pass
+    return None
+
+
+async def _ensure_our_bot_ids():
+    global _our_bot_cache_loaded, _my_userbot_id
+    if _our_bot_cache_loaded: return
+    if bot is None: return
+    try:
+        me = await bot.get_me()
+        if me and getattr(me, "id", None):
+            _my_userbot_id = int(me.id)
+            _our_bot_ids_cache.add(int(me.id))
+    except Exception:
+        pass
+    for uname in OUR_BOT_USERNAMES:
+        try:
+            ent = await resolve_bot(uname)
+            if ent and getattr(ent, "id", None):
+                _our_bot_ids_cache.add(int(ent.id))
+        except Exception:
+            pass
+    _our_bot_cache_loaded = True
+    LOG.info(f"my userbot id: {_my_userbot_id}")
+    LOG.info(f"our bot ids cached: {sorted(_our_bot_ids_cache)}")
+
+
+async def _nuke_worker():
+    while True:
+        try:
+            peer_id, msg_id = await _nuke_queue.get()
+            batch = [(peer_id, msg_id)]
+            deadline = time.monotonic() + _NUKE_BATCH_WAIT
+            while len(batch) < _NUKE_BATCH_MAX:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0: break
+                try:
+                    p, m = await asyncio.wait_for(_nuke_queue.get(), timeout=timeout)
+                    batch.append((p, m))
+                except asyncio.TimeoutError:
+                    break
+            by_peer: Dict[int, list] = {}
+            for p, m in batch:
+                by_peer.setdefault(p, []).append(m)
+            for peer, ids in by_peer.items():
+                try:
+                    await bot.delete_messages(peer, ids)
+                except FloodWaitError as fw:
+                    await asyncio.sleep(min(fw.seconds, 1.0))
+                    try: await bot.delete_messages(peer, ids)
+                    except Exception: pass
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            pass
+
 
 async def safe_edit(event, text: str, **kw):
     if not text: return None
@@ -433,15 +539,12 @@ MENU_TEXT = f"""
 ╚══════════════════════════════╝
 
 ╭━━━━━ 👾 𝐀𝐃𝐌𝐈𝐍 ━━━━━╮
-┃ 👾 .admins       » admin list
-┃ 👾 .addadmin     » add admin
-┃ 👾 .deladmin     » remove admin
+┃ 👾 .admins / .addadmin / .deladmin
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐂𝐇𝐀𝐓 ━━━━━━╮
-┃ 👾 .id / .chatinfo
-┃ 👾 .gc <name>    » create gc
-┃ 👾 .pin / .unpin / .leave
+┃ 👾 .id / .chatinfo / .pin / .unpin
+┃ 👾 .gc <name> / .leave
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐌𝐔𝐓𝐄 ━━━━━━╮
@@ -451,26 +554,23 @@ MENU_TEXT = f"""
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐆𝐑𝐎𝐔𝐏 ━━━━━╮
-┃ 👾 .purge / .throw
-┃ 👾 .add / .addall / .addbots
+┃ 👾 .purge / .throw / .add / .addall / .addbots
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐑𝐀𝐈𝐃 ━━━━━━╮
-┃ 👾 .reply / .sreply
-┃ 👾 .rr / .srr
-┃ 👾 .flag / .sflag
-┃ 👾 .replyshadow / .sshadow
-┃ 👾 .raid / .sraid
-┃ 👾 .swipe / .sswipe
+┃ 👾 .reply / .rr / .flag / .replyshadow
+┃ 👾 .sreply / .srr / .sflag / .sshadow
+┃ 👾 .raid / .swipe / .sraid / .sswipe
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐒𝐏𝐀𝐌 ━━━━━━╮
-┃ 👾 .spray / .dspray
-┃ 👾 .fastgc set/stop
+┃ 👾 .spray / .dspray / .fastgc
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
-╭━━━━━ 👾 𝐀𝐔𝐓𝐎 ━━━━━━╮
-┃ 👾 .ar <emoji> / .sar
+╭━━━━━ 👾 𝐂𝐋𝐄𝐀𝐑 ━━━━━╮
+┃ 👾 .clear on/off       » service msgs
+┃ 👾 .clear bots on/off  » other bots' text
+┃ 👾 .botid <username>   » add to own-cache
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐒𝐍𝐈𝐏𝐄 ━━━━━╮
@@ -487,13 +587,8 @@ MENU_TEXT = f"""
 
 ╭━━━━━ 👾 𝐒𝐘𝐒 ━━━━━━━╮
 ┃ 👾 .ping / .status / .stats / .health
-┃ 👾 .backup / .restore / .reload
-┃ 👾 .debug on/off / .stopall
-┃ 👾 .clear on/off » auto nuke title msgs
-╰━━━━━━━━━━━━━━━━━━━━╯
-
-╭━━━━━ 👾 𝐅𝐔𝐍 ━━━━━━━╮
-┃ 👾 .flip / .dice / .info
+┃ 👾 .backup / .restore / .reload / .stopall
+┃ 👾 .debug on/off
 ╰━━━━━━━━━━━━━━━━━━━━╯
 """.strip()
 
@@ -790,8 +885,7 @@ async def _invite_and_promote(chat_id: int, username: str) -> str:
                 result = "added"
             except Exception as ie:
                 s = str(ie)
-                if "USER_ALREADY_PARTICIPANT" in s or "already" in s.lower():
-                    result = "already"
+                if "USER_ALREADY_PARTICIPANT" in s or "already" in s.lower(): result = "already"
                 else: return "failed"
         elif is_basic:
             try:
@@ -799,8 +893,7 @@ async def _invite_and_promote(chat_id: int, username: str) -> str:
                 result = "added"
             except Exception as ie:
                 s = str(ie)
-                if "USER_ALREADY_PARTICIPANT" in s or "already" in s.lower():
-                    result = "already"
+                if "USER_ALREADY_PARTICIPANT" in s or "already" in s.lower(): result = "already"
                 else: return "failed"
         else: return "failed"
         if is_channel:
@@ -817,6 +910,10 @@ async def _invite_and_promote(chat_id: int, username: str) -> str:
             try:
                 await bot(EditChatAdminRequest(chat_id=chat.id, user_id=ent, is_admin=True))
             except Exception: pass
+        try:
+            if ent and getattr(ent, "id", None):
+                _our_bot_ids_cache.add(int(ent.id))
+        except Exception: pass
         return "promoted" if result == "already" else result
     except Exception as e:
         LOG.warning(f"invite {username} failed: {e}")
@@ -1109,7 +1206,7 @@ async def cmd_dl(event, arg):
             import glob
             loop = asyncio.get_event_loop()
             base = os.path.join(str(DL_DIR), f"dl_{event.id}_{int(time.time())}")
-            opts = {
+            opts = _ydl_youtube_opts({
                 "format": "best[filesize<80M]/best",
                 "outtmpl": f"{base}.%(ext)s",
                 "quiet": True, "no_warnings": True,
@@ -1118,7 +1215,7 @@ async def cmd_dl(event, arg):
                 "user_agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                "AppleWebKit/537.36 (KHTML, like Gecko) "
                                "Chrome/120.0.0.0 Safari/537.36"),
-            }
+            })
             def run():
                 with yt_dlp.YoutubeDL(opts) as ydl: return ydl.extract_info(url, download=True)
             info = await loop.run_in_executor(None, run)
@@ -1152,12 +1249,12 @@ async def cmd_music(event, arg):
         try:
             import glob
             loop = asyncio.get_event_loop()
-            opts = {
+            opts = _ydl_youtube_opts({
                 "format": "bestaudio[abr<=128]/bestaudio",
                 "outtmpl": os.path.join(str(TMP_DIR), "vn_%(id)s.%(ext)s"),
                 "quiet": True, "default_search": "ytsearch1",
                 "noplaylist": True, "retries": 2,
-            }
+            })
             def run():
                 with yt_dlp.YoutubeDL(opts) as ydl: return ydl.extract_info(query, download=True)
             info = await loop.run_in_executor(None, run)
@@ -1180,7 +1277,15 @@ async def cmd_music(event, arg):
             await safe_delete(event)
         except Exception as e:
             LOG.warning(f"music: {e}")
-            await safe_edit(event, f"Music error: {str(e)[:80]}")
+            err = str(e)
+            if "Sign in to confirm" in err or "bot" in err.lower():
+                await safe_edit(event,
+                    "👾 YouTube bot-check hit.\n"
+                    "▸ Fix: export browser cookies → save as `cookies.txt`\n"
+                    "▸ Put it next to shadow_all.py\n"
+                    "▸ Or: `cookies_from_browser.txt` with `chrome` / `edge` / `firefox`")
+            else:
+                await safe_edit(event, f"Music error: {err[:100]}")
     asyncio.create_task(dl_task())
 
 @register_cmd("voice")
@@ -1352,7 +1457,10 @@ async def cmd_status(event, _):
            f"▸ admins : {len(admins)}\n"
            f"▸ muted  : {local_muted} local / {len(global_muted)} global\n"
            f"▸ raids  : {len(raid_tasks)}\n▸ sprays : {len(spray_tasks)}\n"
-           f"▸ swipes : {len(swipe_tasks)}\n▸ mode   : operational")
+           f"▸ swipes : {len(swipe_tasks)}\n▸ mode   : operational\n"
+           f"▸ clear  : service={'ON' if ST.data.get('auto_clear_titles') else 'OFF'} "
+           f"bots={'ON' if ST.data.get('auto_clear_bot_msgs') else 'OFF'}\n"
+           f"▸ our bots cached: {len(_our_bot_ids_cache)}")
     await safe_edit(event, txt)
 
 @register_cmd("stats")
@@ -1380,6 +1488,11 @@ async def cmd_health(event, _):
         results.append(f"▸ yt-dlp   : {_y.version.__version__}")
     except Exception:
         results.append("▸ yt-dlp   : FAIL")
+    results.append(f"▸ our bots : {len(_our_bot_ids_cache)} cached")
+    results.append(f"▸ me       : {_my_userbot_id}")
+    results.append(f"▸ queue    : {_nuke_queue.qsize()} pending")
+    ck = BASE_DIR / "cookies.txt"
+    results.append(f"▸ cookies  : {'yes' if ck.exists() else 'no'}")
     txt = "👾 health 👾\n" + "\n".join(results)
     await safe_edit(event, txt)
 
@@ -1516,6 +1629,23 @@ async def cmd_stopall(event, _):
 @register_cmd("clear")
 async def cmd_clear(event, arg):
     arg = (arg or "").strip().lower()
+
+    # .clear bots on/off → nuke other bots' regular text msgs
+    if arg.startswith("bots"):
+        sub = arg[4:].strip()
+        if sub == "on":   state = True
+        elif sub == "off": state = False
+        else:              state = not ST.data.get("auto_clear_bot_msgs", False)
+        ST.data["auto_clear_bot_msgs"] = state
+        ST.save()
+        return await safe_edit(
+            event,
+            f"👾 nuke other-bots' text msgs ➤ {'ON' if state else 'OFF'}\n"
+            f"▸ target : every bot EXCEPT our SHADOW bots, owner, admins\n"
+            f"▸ use    : `.clear bots on` / `.clear bots off`",
+        )
+
+    # .clear on/off → service msgs
     if arg in ("on", "off"):
         state = (arg == "on")
     else:
@@ -1524,10 +1654,29 @@ async def cmd_clear(event, arg):
     ST.save()
     await safe_edit(
         event,
-        f"👾 auto-clear service msgs ➤ {'ON' if state else 'OFF'}\n"
-        f"▸ scope: chat title + photo change notifications\n"
-        f"▸ mode : instant delete via raw update hook",
+        f"👾 service-msg auto-clear ➤ {'ON' if state else 'OFF'}\n"
+        f"▸ scope : title change + photo change notifications\n"
+        f"▸ skips : our SHADOW bots + owner + admins\n"
+        f"▸ nukes : every other bot's / user's service msg\n"
+        f"▸ speed : batched, ~30ms flush window\n"
+        f"▸ our bots cached: {len(_our_bot_ids_cache)}  |  me: {_my_userbot_id}",
     )
+
+@register_cmd("botid")
+async def cmd_botid(event, arg):
+    global _our_bot_cache_loaded
+    if not arg: return await safe_edit(event, "Use: .botid <username>")
+    uname = arg.strip().lstrip("@")
+    try:
+        ent = await resolve_bot(uname)
+        if not ent or not getattr(ent, "id", None):
+            return await safe_edit(event, f"❌ {uname} not found")
+        uid = int(ent.id)
+        _our_bot_ids_cache.add(uid)
+        _our_bot_cache_loaded = True
+        await safe_edit(event, f"✅ Added to our-bots cache:\n@{uname} → `{uid}`\nTotal: {len(_our_bot_ids_cache)}")
+    except Exception as e:
+        await safe_edit(event, f"❌ {str(e)[:80]}")
 
 @register_cmd("flip")
 async def cmd_flip(event, _):
@@ -1654,6 +1803,31 @@ if bot is not None:
                 except Exception: pass
         except Exception: pass
 
+    @bot.on(events.NewMessage)
+    async def on_bot_msg_nuke(event):
+        """If .clear bots on — delete other bots' text msgs (our bots skip)."""
+        if not ST.data.get("auto_clear_bot_msgs"):
+            return
+        sender = event.sender_id
+        if not sender: return
+        if sender in _our_bot_ids_cache: return
+        if sender == OWNER_ID or sender in admins: return
+        if _my_userbot_id is not None and sender == _my_userbot_id: return
+        try:
+            s = await event.get_sender()
+            if not getattr(s, "bot", False):
+                return
+        except Exception:
+            return
+        try:
+            await event.delete()
+        except FloodWaitError as fw:
+            await asyncio.sleep(min(fw.seconds, 1.0))
+            try: await event.delete()
+            except Exception: pass
+        except Exception:
+            pass
+
     @bot.on(events.NewMessage(outgoing=True))
     async def on_auto_react(event):
         e = auto_react_emoji
@@ -1664,18 +1838,6 @@ if bot is not None:
                 peer=event.chat_id, msg_id=event.id,
                 reaction=[ReactionEmoji(emoticon=e)]))
         except Exception: pass
-
-    # ---------- auto-nuke title/photo service messages ----------
-    async def _nuke_service(peer_id, msg_id, delay: float = 0.0):
-        if delay > 0:
-            await asyncio.sleep(delay)
-        try:
-            await bot.delete_messages(peer_id, [msg_id])
-        except FloodWaitError as fw:
-            # re-arm once with the flood delay
-            asyncio.create_task(_nuke_service(peer_id, msg_id, fw.seconds + 0.5))
-        except Exception:
-            pass
 
     _SERVICE_ACTIONS = (
         types.MessageActionChatEditTitle,
@@ -1699,8 +1861,21 @@ if bot is not None:
         action = getattr(msg, "action", None)
         if not isinstance(action, _SERVICE_ACTIONS):
             return
-        # fire-and-forget so a rename storm doesn't block the update loop
-        asyncio.create_task(_nuke_service(msg.peer_id, msg.id))
+
+        sender_id = _extract_user_id(msg)
+
+        # our own SHADOW bots → NC survives
+        if sender_id is not None and sender_id in _our_bot_ids_cache:
+            return
+        # owner + admins → protected
+        if sender_id is not None and (sender_id == OWNER_ID or sender_id in admins):
+            return
+        # our own userbot account → protected
+        if _my_userbot_id is not None and sender_id == _my_userbot_id:
+            return
+
+        # queue for batched delete — non-blocking
+        _nuke_queue.put_nowait((msg.peer_id, msg.id))
 
     @bot.on(events.NewMessage(outgoing=True))
     async def on_command(event):
@@ -1759,6 +1934,12 @@ async def userbot_main():
         print("=" * 44)
         LOG.info(f"userbot online · {len(commands)} commands")
         try:
+            await _ensure_our_bot_ids()
+        except Exception as e:
+            LOG.warning(f"our-bot cache load failed: {e}")
+        asyncio.create_task(_nuke_worker())
+        LOG.info("nuke worker online")
+        try:
             await bot.run_until_disconnected()
         except (ConnectionError, OSError) as e:
             LOG.warning(f"connection dropped: {e}")
@@ -1771,9 +1952,7 @@ async def userbot_main():
 
 
 # ==================================================================
-# ==================================================================
 #  SECTION 2 — ONBOARDING BOT
-# ==================================================================
 # ==================================================================
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -1859,7 +2038,6 @@ async def _close_telethon(chat_id: int):
         st["client"] = None
 
 
-# ---- /start ----
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await _kill_running(chat_id, do_logout=True)
@@ -1966,8 +2144,7 @@ async def got_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot, chat_id,
         "Code sent to your Telegram app.\n\n"
         "Step 4/4 — Enter the 5-digit code, ONE DIGIT AT A TIME.\n"
-        "Example: send `1`, then `2`, then `3`, then `4`, then `5`.\n"
-        "The bot joins them into 12345 on its own.\n\n"
+        "Example: send `1`, then `2`, then `3`, then `4`, then `5`.\n\n"
         "digit 1/5 :",
     )
     return ASK_CODE
@@ -2000,8 +2177,7 @@ async def got_code_digit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except SessionPasswordNeededError:
         st["digits"] = []
         await _track(context.bot, chat_id,
-                     "2FA password required.\n\nSend your cloud password now.\n"
-                     "The message you send will be deleted automatically.")
+                     "2FA password required.\n\nSend your cloud password now.")
         return ASK_PASSWORD
     except PhoneCodeInvalidError:
         st["digits"] = []
@@ -2066,7 +2242,6 @@ async def _finalize(update, context, chat_id: int):
     cp = _cfg_path(chat_id)
     cp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
-    # wipe the private chat with the bot using the user's own account
     bot_me = await context.bot.get_me()
     await asyncio.sleep(0.4)
     try:
@@ -2080,12 +2255,10 @@ async def _finalize(update, context, chat_id: int):
     except Exception:
         pass
 
-    # disconnect so subprocess can own the session file
     try: await client.disconnect()
     except Exception: pass
     st["client"] = None
 
-    # spawn the userbot subprocess
     env = os.environ.copy()
     env["SHADOW_API_ID"]   = str(cfg["api_id"])
     env["SHADOW_API_HASH"] = cfg["api_hash"]
@@ -2101,11 +2274,9 @@ async def _finalize(update, context, chat_id: int):
     )
     _running[chat_id] = {"proc": proc, "config": str(cp), "user_id": me.id}
 
-    # sweep any tracked messages that survived
     try: await _wipe_tracked(context.bot, chat_id, st)
     except Exception: pass
 
-    # final message with logout button
     kb = InlineKeyboardMarkup(
         [[InlineKeyboardButton("Click here for successfully logout", callback_data="logout")]]
     )
@@ -2113,9 +2284,10 @@ async def _finalize(update, context, chat_id: int):
         chat_id,
         "✅ Login successful.\n\n"
         "Your userbot is now running 24/7.\n"
-        "All commands are live — try `.menu` in any chat.\n\n"
-        "Thanks for using this service.\n\n"
-        "Press the button below to log out completely at any time.",
+        "Try `.menu` in any chat.\n\n"
+        "`.clear on` → nuke title/photo spam from other bots (own NC survives).\n"
+        "`.clear bots on` → also nuke other bots' text msgs.\n\n"
+        "Press the button below to log out completely.",
         reply_markup=kb,
     )
     st["finalized"] = True
@@ -2126,7 +2298,6 @@ def _state_path_for(chat_id: int) -> Path:
     return RUN_DIR / f"state_{chat_id}.json"
 
 
-# ---- logout button ----
 async def logout_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -2162,7 +2333,6 @@ async def logout_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---- onboarding bot main ----
 def bot_main():
     app = Application.builder().token(BOT_TOKEN).build()
     conv = ConversationHandler(
@@ -2184,9 +2354,6 @@ def bot_main():
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-# ==================================================================
-#  DISPATCH
-# ==================================================================
 if __name__ == "__main__":
     if IS_USERBOT:
         try:
