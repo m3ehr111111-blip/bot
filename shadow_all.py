@@ -3,15 +3,17 @@
 # file: shadow_all.py
 # target: Windows cmd / Linux / Termux
 # deps: pip install "python-telegram-bot>=21" telethon yt-dlp gTTS requests
+#       ffmpeg required on PATH (music → ogg/opus transcode)
 #
 # MODE A:  python shadow_all.py            → onboarding bot
 # MODE B:  python shadow_all.py --userbot <chat_id>   → userbot
 #
-# v3.1 fixes:
-#   • YouTube bot-check bypass (extractor_args android/ios/web_safari)
-#   • Optional cookies.txt support (drop in BASE_DIR)
-#   • Own SHADOW bots' NC never deleted
-#   • Other bots/users service msgs deleted instantly (batched)
+# v3.2 changes:
+#   • .clear rewritten — deletes EVERY title/photo change service msg, no whitelist
+#   • .music format selector fixed: bestaudio/best + FFmpegExtractAudio mp3
+#   • .music voice-note transcode mp3→ogg/opus via ffmpeg (real voice note format)
+#   • .music audio fallback: send as mp3 if ffmpeg missing
+#   • .health now reports ffmpeg presence
 
 import asyncio
 import atexit
@@ -22,6 +24,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -312,17 +315,14 @@ flag_texts = [
 def _ydl_youtube_opts(base: dict) -> dict:
     """Add YouTube bot-check bypass options to yt-dlp opts dict."""
     opts = dict(base)
-    # player clients — android/ios/web_safari bypass most bot checks
     ea = opts.setdefault("extractor_args", {})
     ea["youtube"] = {
         "player_client": ["android", "web_safari", "ios", "web"],
         "player_skip": ["webpage", "configs"],
     }
-    # optional cookies.txt drop-in (export from browser extension)
     ck = BASE_DIR / "cookies.txt"
     if ck.exists():
         opts["cookiefile"] = str(ck)
-    # cookiesfrombrowser fallback (only if user opted in)
     cf = BASE_DIR / "cookies_from_browser.txt"
     if cf.exists():
         try:
@@ -332,6 +332,32 @@ def _ydl_youtube_opts(base: dict) -> dict:
         except Exception:
             pass
     return opts
+
+
+# ---------- ffmpeg helpers ----------
+def _ffmpeg_available() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+
+def _mp3_to_ogg_opus(mp3_path: str) -> Optional[str]:
+    """Transcode mp3 → ogg/opus for Telegram voice note. Returns path or None."""
+    if not _ffmpeg_available():
+        return None
+    ogg_path = str(Path(mp3_path).with_suffix(".ogg"))
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", mp3_path,
+             "-c:a", "libopus", "-b:a", "64k",
+             "-ar", "48000", "-ac", "1",
+             ogg_path],
+            capture_output=True, timeout=90,
+        )
+        if r.returncode == 0 and os.path.exists(ogg_path) and os.path.getsize(ogg_path) > 0:
+            return ogg_path
+        LOG.warning(f"ffmpeg rc={r.returncode}: {r.stderr[-300:].decode(errors='ignore')}")
+    except Exception as e:
+        LOG.warning(f"ogg transcode failed: {e}")
+    return None
 
 
 # ---------- helpers ----------
@@ -568,9 +594,9 @@ MENU_TEXT = f"""
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐂𝐋𝐄𝐀𝐑 ━━━━━╮
-┃ 👾 .clear on/off       » service msgs
+┃ 👾 .clear on/off       » GC name/photo spam
 ┃ 👾 .clear bots on/off  » other bots' text
-┃ 👾 .botid <username>   » add to own-cache
+┃ 👾 .botid <username>   » own-bot cache
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐒𝐍𝐈𝐏𝐄 ━━━━━╮
@@ -1240,43 +1266,92 @@ async def cmd_dl(event, arg):
             await safe_edit(event, f"👾 {str(e)[:120]}")
     asyncio.create_task(dl_task())
 
+# ---------- .music — FIXED ----------
 @register_cmd("music")
 async def cmd_music(event, arg):
     if not arg: return await safe_edit(event, "Use: .music <song>")
     query = arg.strip()
     await safe_edit(event, f"Searching: {query}")
+
     async def dl_task():
+        mp3_path = None
+        ogg_path = None
         try:
             import glob
             loop = asyncio.get_event_loop()
+
+            # Robust format chain: bestaudio → best, then FFmpegExtractAudio
+            # hard-locks output to mp3. This kills the "Requested format is
+            # not available" error because we no longer filter on abr.
             opts = _ydl_youtube_opts({
-                "format": "bestaudio[abr<=128]/bestaudio",
+                "format": "bestaudio/best",
                 "outtmpl": os.path.join(str(TMP_DIR), "vn_%(id)s.%(ext)s"),
-                "quiet": True, "default_search": "ytsearch1",
-                "noplaylist": True, "retries": 2,
+                "quiet": True, "no_warnings": True,
+                "default_search": "ytsearch1",
+                "noplaylist": True, "retries": 3,
+                "nocheckcertificate": True,
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "128",
+                }],
             })
+
             def run():
-                with yt_dlp.YoutubeDL(opts) as ydl: return ydl.extract_info(query, download=True)
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(query, download=True)
+
             info = await loop.run_in_executor(None, run)
-            if "entries" in info: info = info["entries"][0]
-            vid = info.get("id"); title = info.get("title") or query
-            dur = info.get("duration") or 0
+            if isinstance(info, dict) and "entries" in info and info["entries"]:
+                info = info["entries"][0]
+
+            vid   = info.get("id") if isinstance(info, dict) else None
+            title = (info.get("title") if isinstance(info, dict) else None) or query
+            dur   = (info.get("duration") if isinstance(info, dict) else 0) or 0
             dtext = f"{dur // 60}:{dur % 60:02d}"
-            files = glob.glob(os.path.join(str(TMP_DIR), f"vn_{vid}.*"))
-            if not files: return await safe_edit(event, "Download failed")
-            src = files[0]
+
+            if not vid:
+                return await safe_edit(event, "Download failed — no video id")
+
+            # postprocessor guarantees .mp3 next to the base
+            candidates = glob.glob(os.path.join(str(TMP_DIR), f"vn_{vid}.*"))
+            mp3s = [f for f in candidates if f.lower().endswith(".mp3")]
+            if not mp3s:
+                # fallback: whatever audio-ish file landed
+                audio_exts = (".m4a", ".webm", ".opus", ".ogg", ".aac", ".wav", ".mp4")
+                fallback = [f for f in candidates if f.lower().endswith(audio_exts)]
+                if not fallback:
+                    return await safe_edit(event, "Download failed — no audio file")
+                mp3_path = fallback[0]
+            else:
+                mp3_path = mp3s[0]
+
             clean = re.sub(r"[^\w\s-]", "", title).strip()[:40] or "audio"
-            new = os.path.join(str(TMP_DIR), f"{clean}.ogg")
-            try: os.rename(src, new)
-            except Exception: new = src
             await safe_edit(event, f"Sending: {clean}")
-            await bot.send_file(event.chat_id, new, voice_note=True,
-                                caption=f"Music\n{clean}\n{dtext}")
-            try: os.remove(new)
-            except Exception: pass
+
+            # Preferred: transcode to ogg/opus → real Telegram voice note
+            voice_ready = None
+            if mp3_path.lower().endswith(".mp3"):
+                voice_ready = _mp3_to_ogg_opus(mp3_path)
+                ogg_path = voice_ready
+
+            if voice_ready and os.path.exists(voice_ready):
+                await bot.send_file(
+                    event.chat_id, voice_ready, voice_note=True,
+                    caption=f"Music\n{clean}\n{dtext}",
+                )
+            else:
+                # Fallback: send as plain audio file (works without ffmpeg)
+                await bot.send_file(
+                    event.chat_id, mp3_path,
+                    caption=f"Music\n{clean}\n{dtext}",
+                    attributes=[],
+                )
+
             await safe_delete(event)
+
         except Exception as e:
-            LOG.warning(f"music: {e}")
+            LOG.warning(f"music: {e}\n{traceback.format_exc()}")
             err = str(e)
             if "Sign in to confirm" in err or "bot" in err.lower():
                 await safe_edit(event,
@@ -1284,8 +1359,18 @@ async def cmd_music(event, arg):
                     "▸ Fix: export browser cookies → save as `cookies.txt`\n"
                     "▸ Put it next to shadow_all.py\n"
                     "▸ Or: `cookies_from_browser.txt` with `chrome` / `edge` / `firefox`")
+            elif "Requested format is not available" in err:
+                await safe_edit(event,
+                    "👾 Format selector miss — video has no bestaudio/best stream.\n"
+                    "▸ Retry with .dl <url> to pull the raw file")
             else:
-                await safe_edit(event, f"Music error: {err[:100]}")
+                await safe_edit(event, f"Music error: {err[:120]}")
+        finally:
+            for p in (mp3_path, ogg_path):
+                if p:
+                    try: os.remove(p)
+                    except Exception: pass
+
     asyncio.create_task(dl_task())
 
 @register_cmd("voice")
@@ -1488,6 +1573,7 @@ async def cmd_health(event, _):
         results.append(f"▸ yt-dlp   : {_y.version.__version__}")
     except Exception:
         results.append("▸ yt-dlp   : FAIL")
+    results.append(f"▸ ffmpeg   : {'yes' if _ffmpeg_available() else 'NO (voice-note fallback = mp3)'}")
     results.append(f"▸ our bots : {len(_our_bot_ids_cache)} cached")
     results.append(f"▸ me       : {_my_userbot_id}")
     results.append(f"▸ queue    : {_nuke_queue.qsize()} pending")
@@ -1626,6 +1712,7 @@ async def cmd_stopall(event, _):
     txt = ("👾 Everything stopped\n" + ", ".join(stopped)) if stopped else "👾 Nothing was active"
     await safe_edit(event, txt)
 
+# ---------- .clear — REWRITTEN, no exceptions ----------
 @register_cmd("clear")
 async def cmd_clear(event, arg):
     arg = (arg or "").strip().lower()
@@ -1645,7 +1732,8 @@ async def cmd_clear(event, arg):
             f"▸ use    : `.clear bots on` / `.clear bots off`",
         )
 
-    # .clear on/off → service msgs
+    # .clear on/off → service msgs (GC title/photo changes)
+    # NEW: no whitelist — every name change service msg gets nuked.
     if arg in ("on", "off"):
         state = (arg == "on")
     else:
@@ -1654,12 +1742,11 @@ async def cmd_clear(event, arg):
     ST.save()
     await safe_edit(
         event,
-        f"👾 service-msg auto-clear ➤ {'ON' if state else 'OFF'}\n"
-        f"▸ scope : title change + photo change notifications\n"
-        f"▸ skips : our SHADOW bots + owner + admins\n"
-        f"▸ nukes : every other bot's / user's service msg\n"
-        f"▸ speed : batched, ~30ms flush window\n"
-        f"▸ our bots cached: {len(_our_bot_ids_cache)}  |  me: {_my_userbot_id}",
+        f"👾 GC name/photo auto-clear ➤ {'ON' if state else 'OFF'}\n"
+        f"▸ scope  : every title change + photo change service msg\n"
+        f"▸ who    : EVERYONE — no whitelist, no exceptions\n"
+        f"▸ speed  : batched, ~30ms flush window\n"
+        f"▸ use    : `.clear on` / `.clear off`",
     )
 
 @register_cmd("botid")
@@ -1844,8 +1931,10 @@ if bot is not None:
         types.MessageActionChatEditPhoto,
         types.MessageActionChatDeletePhoto,
         types.MessageActionChannelCreate,
+        types.MessageActionChatCreate,
     )
 
+    # ---------- REWRITTEN: no whitelist, every title/photo change dies ----------
     @bot.on(events.Raw(types=[
         types.UpdateNewChannelMessage,
         types.UpdateNewMessage,
@@ -1861,20 +1950,8 @@ if bot is not None:
         action = getattr(msg, "action", None)
         if not isinstance(action, _SERVICE_ACTIONS):
             return
-
-        sender_id = _extract_user_id(msg)
-
-        # our own SHADOW bots → NC survives
-        if sender_id is not None and sender_id in _our_bot_ids_cache:
-            return
-        # owner + admins → protected
-        if sender_id is not None and (sender_id == OWNER_ID or sender_id in admins):
-            return
-        # our own userbot account → protected
-        if _my_userbot_id is not None and sender_id == _my_userbot_id:
-            return
-
-        # queue for batched delete — non-blocking
+        # no exceptions — every title/photo change service msg gets nuked,
+        # regardless of who fired it (own bots, owner, admins, randoms).
         _nuke_queue.put_nowait((msg.peer_id, msg.id))
 
     @bot.on(events.NewMessage(outgoing=True))
@@ -2285,8 +2362,9 @@ async def _finalize(update, context, chat_id: int):
         "✅ Login successful.\n\n"
         "Your userbot is now running 24/7.\n"
         "Try `.menu` in any chat.\n\n"
-        "`.clear on` → nuke title/photo spam from other bots (own NC survives).\n"
-        "`.clear bots on` → also nuke other bots' text msgs.\n\n"
+        "`.clear on` → nuke every GC name/photo change msg (no whitelist).\n"
+        "`.clear bots on` → also nuke other bots' text msgs.\n"
+        "`.music <song>` → downloads + sends as real voice note (needs ffmpeg).\n\n"
         "Press the button below to log out completely.",
         reply_markup=kb,
     )
