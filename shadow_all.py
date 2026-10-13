@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # language: Python 3.10+
 # file: shadow_all.py
-# target: Windows cmd / Linux / Termux
+# target: Windows cmd / Linux / Termux / Railway (Docker)
 # deps: pip install "python-telegram-bot>=21" telethon yt-dlp gTTS requests
 #       ffmpeg required on PATH (music → ogg/opus transcode)
 #
 # MODE A:  python shadow_all.py            → onboarding bot
-# MODE B:  python shadow_all.py --userbot <chat_id>   → userbot
+# MODE B:  python shadow_all.py --userbot  → userbot
 #
-# v3.2 changes:
-#   • .clear rewritten — deletes EVERY title/photo change service msg, no whitelist
+# v3.3:
+#   • Railway-ready: DATA_DIR env → session/state/cookies on persistent volume
+#   • BOT_TOKEN via SHADOW_BOT_TOKEN env
+#   • .clear rewritten — every title/photo change msg dies, no whitelist
 #   • .music format selector fixed: bestaudio/best + FFmpegExtractAudio mp3
-#   • .music voice-note transcode mp3→ogg/opus via ffmpeg (real voice note format)
-#   • .music audio fallback: send as mp3 if ffmpeg missing
-#   • .health now reports ffmpeg presence
+#   • .music voice-note transcode mp3→ogg/opus via ffmpeg
+#   • .music fallback: plain mp3 if ffmpeg missing
 
 import asyncio
 import atexit
@@ -38,15 +39,17 @@ from typing import Dict, Optional, Set
 #  paths
 # ------------------------------------------------------------------
 BASE_DIR  = Path(__file__).resolve().parent
-USERS_DIR = BASE_DIR / "users"
-SESS_DIR  = BASE_DIR / "sessions"
-RUN_DIR   = BASE_DIR / "run"
+DATA_DIR  = Path(os.environ.get("SHADOW_DATA_DIR", str(BASE_DIR)))
+USERS_DIR = DATA_DIR / "users"
+SESS_DIR  = DATA_DIR / "sessions"
+RUN_DIR   = DATA_DIR / "run"
 DL_DIR    = BASE_DIR / "downloads"
 TMP_DIR   = BASE_DIR / "temp"
-for d in (USERS_DIR, SESS_DIR, RUN_DIR, DL_DIR, TMP_DIR):
+for d in (DATA_DIR, USERS_DIR, SESS_DIR, RUN_DIR, DL_DIR, TMP_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-BOT_TOKEN = "8855726336:AAFgXfhKTssjc9QSRwa0dhoBOWToqF_OjDo"
+BOT_TOKEN = os.environ.get("SHADOW_BOT_TOKEN",
+                           "8855726336:AAFgXfhKTssjc9QSRwa0dhoBOWToqF_OjDo")
 
 # ------------------------------------------------------------------
 #  logging
@@ -108,8 +111,8 @@ API_ID    = int(os.environ.get("SHADOW_API_ID",   "0"))
 API_HASH  = os.environ.get("SHADOW_API_HASH",     "")
 OWNER_ID  = int(os.environ.get("SHADOW_OWNER_ID", "0"))
 PHONE     = os.environ.get("SHADOW_PHONE",        "")
-SESSION   = os.environ.get("SHADOW_SESSION",      str(BASE_DIR / "shadoww"))
-STATE_FILE = os.environ.get("SHADOW_STATE",       str(BASE_DIR / "shadow_state.json"))
+SESSION    = os.environ.get("SHADOW_SESSION", str(DATA_DIR / "shadoww"))
+STATE_FILE = os.environ.get("SHADOW_STATE",   str(DATA_DIR / "shadow_state.json"))
 
 BRAND = "𝐒 𝐇 𝐀 𝐃 𝐎 𝐖 𝐖"
 
@@ -313,24 +316,30 @@ flag_texts = [
 
 # ---------- yt-dlp YouTube bypass ----------
 def _ydl_youtube_opts(base: dict) -> dict:
-    """Add YouTube bot-check bypass options to yt-dlp opts dict."""
+    """Add YouTube bot-check bypass + cookie attach to yt-dlp opts dict."""
     opts = dict(base)
     ea = opts.setdefault("extractor_args", {})
     ea["youtube"] = {
         "player_client": ["android", "web_safari", "ios", "web"],
         "player_skip": ["webpage", "configs"],
     }
-    ck = BASE_DIR / "cookies.txt"
-    if ck.exists():
-        opts["cookiefile"] = str(ck)
-    cf = BASE_DIR / "cookies_from_browser.txt"
-    if cf.exists():
-        try:
-            br = cf.read_text(encoding="utf-8").strip().lower()
-            if br in ("chrome", "edge", "firefox", "brave", "opera", "chromium"):
-                opts["cookiesfrombrowser"] = (br,)
-        except Exception:
-            pass
+    # cookies.txt — check DATA_DIR first (Railway volume), then BASE_DIR
+    for ck_dir in (DATA_DIR, BASE_DIR):
+        ck = ck_dir / "cookies.txt"
+        if ck.exists():
+            opts["cookiefile"] = str(ck)
+            break
+    # cookies_from_browser.txt fallback
+    for cf_dir in (DATA_DIR, BASE_DIR):
+        cf = cf_dir / "cookies_from_browser.txt"
+        if cf.exists():
+            try:
+                br = cf.read_text(encoding="utf-8").strip().lower()
+                if br in ("chrome", "edge", "firefox", "brave", "opera", "chromium"):
+                    opts["cookiesfrombrowser"] = (br,)
+            except Exception:
+                pass
+            break
     return opts
 
 
@@ -1266,7 +1275,7 @@ async def cmd_dl(event, arg):
             await safe_edit(event, f"👾 {str(e)[:120]}")
     asyncio.create_task(dl_task())
 
-# ---------- .music — FIXED ----------
+# ---------- .music — fixed ----------
 @register_cmd("music")
 async def cmd_music(event, arg):
     if not arg: return await safe_edit(event, "Use: .music <song>")
@@ -1280,9 +1289,6 @@ async def cmd_music(event, arg):
             import glob
             loop = asyncio.get_event_loop()
 
-            # Robust format chain: bestaudio → best, then FFmpegExtractAudio
-            # hard-locks output to mp3. This kills the "Requested format is
-            # not available" error because we no longer filter on abr.
             opts = _ydl_youtube_opts({
                 "format": "bestaudio/best",
                 "outtmpl": os.path.join(str(TMP_DIR), "vn_%(id)s.%(ext)s"),
@@ -1313,11 +1319,9 @@ async def cmd_music(event, arg):
             if not vid:
                 return await safe_edit(event, "Download failed — no video id")
 
-            # postprocessor guarantees .mp3 next to the base
             candidates = glob.glob(os.path.join(str(TMP_DIR), f"vn_{vid}.*"))
             mp3s = [f for f in candidates if f.lower().endswith(".mp3")]
             if not mp3s:
-                # fallback: whatever audio-ish file landed
                 audio_exts = (".m4a", ".webm", ".opus", ".ogg", ".aac", ".wav", ".mp4")
                 fallback = [f for f in candidates if f.lower().endswith(audio_exts)]
                 if not fallback:
@@ -1329,7 +1333,6 @@ async def cmd_music(event, arg):
             clean = re.sub(r"[^\w\s-]", "", title).strip()[:40] or "audio"
             await safe_edit(event, f"Sending: {clean}")
 
-            # Preferred: transcode to ogg/opus → real Telegram voice note
             voice_ready = None
             if mp3_path.lower().endswith(".mp3"):
                 voice_ready = _mp3_to_ogg_opus(mp3_path)
@@ -1341,7 +1344,6 @@ async def cmd_music(event, arg):
                     caption=f"Music\n{clean}\n{dtext}",
                 )
             else:
-                # Fallback: send as plain audio file (works without ffmpeg)
                 await bot.send_file(
                     event.chat_id, mp3_path,
                     caption=f"Music\n{clean}\n{dtext}",
@@ -1357,7 +1359,7 @@ async def cmd_music(event, arg):
                 await safe_edit(event,
                     "👾 YouTube bot-check hit.\n"
                     "▸ Fix: export browser cookies → save as `cookies.txt`\n"
-                    "▸ Put it next to shadow_all.py\n"
+                    "▸ Put it in DATA_DIR (Railway: /data) or next to shadow_all.py\n"
                     "▸ Or: `cookies_from_browser.txt` with `chrome` / `edge` / `firefox`")
             elif "Requested format is not available" in err:
                 await safe_edit(event,
@@ -1576,8 +1578,9 @@ async def cmd_health(event, _):
     results.append(f"▸ ffmpeg   : {'yes' if _ffmpeg_available() else 'NO (voice-note fallback = mp3)'}")
     results.append(f"▸ our bots : {len(_our_bot_ids_cache)} cached")
     results.append(f"▸ me       : {_my_userbot_id}")
+    results.append(f"▸ data dir : {DATA_DIR}")
     results.append(f"▸ queue    : {_nuke_queue.qsize()} pending")
-    ck = BASE_DIR / "cookies.txt"
+    ck = DATA_DIR / "cookies.txt"
     results.append(f"▸ cookies  : {'yes' if ck.exists() else 'no'}")
     txt = "👾 health 👾\n" + "\n".join(results)
     await safe_edit(event, txt)
@@ -1712,12 +1715,11 @@ async def cmd_stopall(event, _):
     txt = ("👾 Everything stopped\n" + ", ".join(stopped)) if stopped else "👾 Nothing was active"
     await safe_edit(event, txt)
 
-# ---------- .clear — REWRITTEN, no exceptions ----------
+# ---------- .clear — rewritten, no exceptions ----------
 @register_cmd("clear")
 async def cmd_clear(event, arg):
     arg = (arg or "").strip().lower()
 
-    # .clear bots on/off → nuke other bots' regular text msgs
     if arg.startswith("bots"):
         sub = arg[4:].strip()
         if sub == "on":   state = True
@@ -1732,8 +1734,6 @@ async def cmd_clear(event, arg):
             f"▸ use    : `.clear bots on` / `.clear bots off`",
         )
 
-    # .clear on/off → service msgs (GC title/photo changes)
-    # NEW: no whitelist — every name change service msg gets nuked.
     if arg in ("on", "off"):
         state = (arg == "on")
     else:
@@ -1892,7 +1892,6 @@ if bot is not None:
 
     @bot.on(events.NewMessage)
     async def on_bot_msg_nuke(event):
-        """If .clear bots on — delete other bots' text msgs (our bots skip)."""
         if not ST.data.get("auto_clear_bot_msgs"):
             return
         sender = event.sender_id
@@ -1934,7 +1933,6 @@ if bot is not None:
         types.MessageActionChatCreate,
     )
 
-    # ---------- REWRITTEN: no whitelist, every title/photo change dies ----------
     @bot.on(events.Raw(types=[
         types.UpdateNewChannelMessage,
         types.UpdateNewMessage,
@@ -1950,8 +1948,7 @@ if bot is not None:
         action = getattr(msg, "action", None)
         if not isinstance(action, _SERVICE_ACTIONS):
             return
-        # no exceptions — every title/photo change service msg gets nuked,
-        # regardless of who fired it (own bots, owner, admins, randoms).
+        # no whitelist — every title/photo change msg dies
         _nuke_queue.put_nowait((msg.peer_id, msg.id))
 
     @bot.on(events.NewMessage(outgoing=True))
@@ -2008,6 +2005,7 @@ async def userbot_main():
         print(f"  logged in : {me.first_name} ({un})")
         print(f"  user id   : {me.id}")
         print(f"  session   : {SESSION}.session")
+        print(f"  data dir  : {DATA_DIR}")
         print("=" * 44)
         LOG.info(f"userbot online · {len(commands)} commands")
         try:
@@ -2050,6 +2048,9 @@ def _cfg_path(chat_id: int) -> Path:
 
 def _session_path(chat_id: int) -> Path:
     return SESS_DIR / f"session_{chat_id}"
+
+def _state_path_for(chat_id: int) -> Path:
+    return RUN_DIR / f"state_{chat_id}.json"
 
 
 async def _track(bot_app, chat_id: int, text: str, **kw):
@@ -2343,6 +2344,7 @@ async def _finalize(update, context, chat_id: int):
     env["SHADOW_PHONE"]    = cfg["phone"]
     env["SHADOW_SESSION"]  = cfg["session"]
     env["SHADOW_STATE"]    = cfg["state"]
+    env["SHADOW_DATA_DIR"] = str(DATA_DIR)
 
     proc = subprocess.Popen(
         [sys.executable, str(Path(__file__).resolve()), "--userbot", str(chat_id)],
@@ -2364,16 +2366,12 @@ async def _finalize(update, context, chat_id: int):
         "Try `.menu` in any chat.\n\n"
         "`.clear on` → nuke every GC name/photo change msg (no whitelist).\n"
         "`.clear bots on` → also nuke other bots' text msgs.\n"
-        "`.music <song>` → downloads + sends as real voice note (needs ffmpeg).\n\n"
+        "`.music <song>` → downloads + sends as voice note (needs ffmpeg).\n\n"
         "Press the button below to log out completely.",
         reply_markup=kb,
     )
     st["finalized"] = True
     return ConversationHandler.END
-
-
-def _state_path_for(chat_id: int) -> Path:
-    return RUN_DIR / f"state_{chat_id}.json"
 
 
 async def logout_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
