@@ -1,5 +1,7 @@
-python-telegram-bot>=21.0
-telethon>=1.36
-yt-dlp>=2024.8.6
-gTTS>=2.5.0
-requests>=2.31.0
+python-telegram-bot>=21
+telethon
+yt-dlp
+yt-dlp-ejs
+bgutil-ytdlp-pot-provider
+gTTS
+requests
