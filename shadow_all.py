@@ -2,19 +2,20 @@
 # language: Python 3.10+
 # file: shadow_all.py
 # target: Windows cmd / Linux / Termux / Railway (Docker)
-# deps: pip install "python-telegram-bot>=21" telethon yt-dlp gTTS requests
+# deps: pip install "python-telegram-bot>=21" telethon yt-dlp yt-dlp-ejs bgutil-ytdlp-pot-provider gTTS requests
 #       ffmpeg required on PATH (music → ogg/opus transcode)
+#       deno OR node required on PATH (yt-dlp JS challenge solver)
 #
 # MODE A:  python shadow_all.py            → onboarding bot
 # MODE B:  python shadow_all.py --userbot  → userbot
 #
-# v3.3:
-#   • Railway-ready: DATA_DIR env → session/state/cookies on persistent volume
-#   • BOT_TOKEN via SHADOW_BOT_TOKEN env
-#   • .clear rewritten — every title/photo change msg dies, no whitelist
-#   • .music format selector fixed: bestaudio/best + FFmpegExtractAudio mp3
-#   • .music voice-note transcode mp3→ogg/opus via ffmpeg
-#   • .music fallback: plain mp3 if ffmpeg missing
+# v3.5:
+#   • reply texts sourced from vaani pack — every emoji collapsed to single 👾
+#   • .hrr / .shr  → heart raid (new)
+#   • .replygod    → 3x burst alias of .replyshadow
+#   • .clear rewritten — event.action based, deletes ANY service msg in GC
+#   • MENU: CLEAR section removed, .clear folded into TOOLS
+#   • YouTube 2026 fix — tv/web/android_vr/ios client order, deno JS, POT plugin
 
 import asyncio
 import atexit
@@ -99,7 +100,8 @@ try:
     from telethon.tl.types import ChatAdminRights, ReactionEmoji
 except Exception as e:
     print(f"missing dep: {e}")
-    print("pip install \"python-telegram-bot>=21\" telethon yt-dlp gTTS requests")
+    print("pip install \"python-telegram-bot>=21\" telethon yt-dlp yt-dlp-ejs "
+          "bgutil-ytdlp-pot-provider gTTS requests")
     sys.exit(1)
 
 
@@ -136,6 +138,7 @@ _DEFAULT_STATE = {
     "rr_targets":     [],
     "flag_targets":   [],
     "shadow_targets": [],
+    "hrr_targets":    [],
     "auto_react":   None,
     "auto_clear_titles":   False,
     "auto_clear_bot_msgs": False,
@@ -191,6 +194,7 @@ reply_users: Set[int]      = set(int(x) for x in ST.data.get("reply_targets", []
 rr_users: Set[int]         = set(int(x) for x in ST.data.get("rr_targets", []))
 flag_users: Set[int]       = set(int(x) for x in ST.data.get("flag_targets", []))
 replyshadow_users: Set[int]= set(int(x) for x in ST.data.get("shadow_targets", []))
+hrr_users: Set[int]        = set(int(x) for x in ST.data.get("hrr_targets", []))
 menu_banner_msg: Optional[tuple] = tuple(ST.data["banner"]) if ST.data.get("banner") else None
 auto_react_emoji: Optional[str]  = ST.data.get("auto_react")
 
@@ -213,6 +217,7 @@ def persist():
     ST.data["rr_targets"]     = sorted(rr_users)
     ST.data["flag_targets"]   = sorted(flag_users)
     ST.data["shadow_targets"] = sorted(replyshadow_users)
+    ST.data["hrr_targets"]    = sorted(hrr_users)
     ST.data["auto_react"]     = auto_react_emoji
     ST.data["banner"]         = list(menu_banner_msg) if menu_banner_msg else None
     ST.save()
@@ -242,94 +247,154 @@ FASTGC_STATE  = {"active": False, "template": None, "task": None, "chat_id": Non
 _cooldowns: Dict[tuple, float] = {}
 
 
+# ==================================================================
+#  TAUNT PACKS — vaani sources, every line ends with single 👾
+# ==================================================================
+
 RAID_MESSAGES = [
-    "👾 ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴀᴀɢ ʟᴀɢᴀ ᴅᴜɴɢᴀ 👾",
-    "👾 ʜᴀʀ ᴍᴇꜱꜱᴀɢᴇ ᴘᴇ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ʏᴀᴀᴅ ᴅɪʟᴀᴛᴀ ʜᴜ 👾",
-    "👾 ᴛᴇʀᴇ ʙᴀᴀᴘ ᴋᴀ ɴᴀᴀᴍ ʟᴇᴋᴇ ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴄʜᴏᴅ ᴅᴜɴɢᴀ 👾",
-    "👾 ᴋʏᴀ ʀᴇ ᴄʜᴏᴅᴜ ᴛʏᴘɪɴɢ ʀᴏᴋ ɢᴀʏɪ ᴋʏᴀ ᴛᴇʀɪ 👾",
-    "👾 ɴᴀꜱᴀ ꜱᴇ ɴᴇᴡꜱ ᴀᴀʏɪ ᴛᴇʀɪ ᴍᴀᴀ ɢᴀʟɪ ɢᴀʟɪ ᴄʜᴜᴅ ʀᴀʜɪ ʜᴀɪ 👾",
-    "👾 ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴘɪᴄ ᴅᴇᴋʜɪ ᴏʀ ʟᴜɴᴅ ᴋʜᴀᴅᴀ ʜᴏ ɢᴀʏᴀ 👾",
-    "👾 ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴍᴇɴᴇ ʀᴀɴᴅɪ ʙᴀɴᴀ ᴋᴇ ᴛᴇʀᴇ ᴄʜᴀᴄʜᴀ ᴋᴇ ꜱᴀᴛʜ ʙᴇᴄʜ ᴅɪʏᴀ 👾",
-    "👾 ʙʜᴏꜱᴅɪᴋᴇ ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ʙʜᴏꜱᴅᴀ ᴍᴇʀᴀ ʜᴀɪ ᴊᴀʙ ᴄʜᴀʜᴇ ᴄʜᴏᴅ ᴅᴜɴɢᴀ 👾",
-    "👾 ᴋʏᴀ ʀᴇ ᴍᴀᴅᴀʀᴄʜᴏᴅ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴇ ᴍᴇʀᴀ ʟᴜɴᴅ ɢʜᴜꜱᴀ ᴅᴜɴɢᴀ 👾",
-    "👾 ᴛᴇʀᴇ ᴋʜᴀɴᴅᴀɴ ᴋɪ ʟᴀꜱʜ ᴋᴏ ɢᴀʟɪ ɢᴀʟɪ ɢʜᴜᴍᴀᴜɴɢᴀ 👾",
-    "👾 ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴍᴇʀᴀ ʙᴇᴛᴀ ʜᴀɪ ᴊᴀɴᴛᴀ ʜᴀɪ ᴋʏᴀ 👾",
-    "👾 ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ ᴀᴋᴀʟ ᴀᴀᴛɪ ᴛᴏ ʙᴏʟ ᴡʀɴᴀ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀᴀʀ ᴅᴜɴɢᴀ 👾",
+    "𝐊ʸᴀ 𝐑ᴇ 𝐓ᴇʀɪ 𝐂ᴏᴏʟ 𝐁ᴀᴛᴇ𝐇 ᴛᴜ 𝐂ʜᴏᴅ 𝐀ᴘɴɪ 𝐁ᴇᴇɴ ᴛᴇxxᴛ 𝐒ᴇ 👾",
+    "𝐉ɪ 𝐌ᴏᴏ 𝐌ᴏᴏᴋ 𝐆ᴏʟɪ 𝐘ᴏᴏᴋ - 𝐉ᴇ 𝐓ᴇxxᴛ 👾",
+    "acha beta ? coi na me toh HATER codunga 👾",
+    "chudke bhaga kaise 👾",
+    "ne toh 𝐓ᴇxxᴛ ka lun muh me lelia 👾",
+    "try maa सूर्य nikalte hi pel du 👾",
+    "mkl lun te vaj 👾",
+    "𝑻ᴏʟᴇ pe 𝐓ᴇxxᴛ ka hamla 👾",
+    "oi 𝐓ᴇʀɪ 𝐌‐ᴏᴏ गुलाम 👾",
+    "chl rndyce chud ke dikha 👾",
+    "𝐉ɪ 𝐌ᴏᴏ 𝐌ᴏᴏᴋ 𝐆ᴏʟɪ naacho 👾",
+    "tera baap bass 𝐓ᴇxxᴛ hai 👾",
+    "try maa hagte hue paad mari 👾",
+    "𝐓ᴇʀɪ 𝐌‐ᴏᴏᴋ 𝐂ʜᴏᴅ 𝐃ɪ 𝐓ᴇxxᴛ 𝐍ᴇ 𝐁ʜᴇᴇᴄʜᴇ 𝐁ʜᴇᴇᴄʜᴇ 👾",
+    "𝐂ʜʜ 𝐍ᴇᴋᴏᴜᴛᴇ 𝐉ᴇ लड़के 👾",
 ]
+
 SWIPE_MESSAGES = [
-    "👾 ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴄʜᴏᴅ ᴋᴇ ᴋᴏᴛʜɪ ᴍᴇ ꜰᴇᴋ ᴀᴀᴜɴɢᴀ 👾",
-    "👾 ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ꜱᴜᴘᴇʀᴄᴀʀ ɢʜᴜꜱᴀ ᴅᴜɴɢᴀ 👾",
-    "👾 ᴋʏᴀ ʀᴇ ʀᴀɴᴅɪ ᴋᴇ ʀᴇᴘʟʏ ɴᴀʜɪ ᴋᴀʀᴛᴀ 👾",
-    "👾 ᴛᴇʀᴀ ʙᴀᴀᴘ ʜᴜ ᴍᴀɪ ᴄʜᴜᴘ ᴋᴀʀ ʀᴀɴᴅɪᴋᴇ 👾",
-    "👾 ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ʙʜᴏꜱᴅᴀ ᴛᴇʀᴇ ʜᴀᴡᴀʟᴇ ᴋᴀʀ ᴅᴜɴɢᴀ 👾",
-    "👾 ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴀᴀɢ ʟᴀɢᴀ ᴋᴇ ʀᴀᴀᴋʜ ᴋᴀʀ ᴅᴜɴɢᴀ 👾",
-    "👾 ᴇᴋ ᴍᴇꜱꜱᴀɢᴇ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ʟᴀꜱʜ ɢᴀʟɪ ᴍᴇ ᴘᴀᴅɪ ʜᴏɢɪ 👾",
-    "👾 ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴍᴇɴᴇ ʀᴀɴᴅɪ ʙᴀɴᴀ ᴅɪʏᴀ 👾",
-    "👾 ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʟᴜɴᴅ ᴅᴀᴀʟ ᴅᴜɴɢᴀ 👾",
-    "👾 ᴛᴇʀᴀ ᴋʜᴀɴᴅᴀɴ ᴋʜᴀᴛᴍ ᴛᴇʀɪ ᴍᴀᴀ ꜱᴇ ꜱʜᴜʀᴜ ʜᴏᴛᴀ ʜᴀɪ 👾",
+    "chudke bhaga kaise 👾",
+    "ne toh 𝐓ᴇxxᴛ ka lun muh me lelia 👾",
+    "try maa सूर्य nikalte hi pel du 👾",
+    "mkl lun te vaj 👾",
+    "𝑻ᴏʟᴇ pe 𝐓ᴇxxᴛ ka hamla 👾",
+    "𝐂ʜʜ 𝐍ᴇᴋᴏᴜᴛᴇ 𝐉ᴇ लड़के 👾",
+    "oi 𝐓ᴇʀɪ 𝐌‐ᴏᴏ गुलाम 👾",
+    "chl rndyce chud ke dikha 👾",
+    "𝐉ɪ 𝐌ᴏᴏ 𝐌ᴏᴏᴋ 𝐆ᴏʟɪ naacho 👾",
+    "tera baap bass 𝐓ᴇxxᴛ hai 👾",
+    "try maa hagte hue paad mari 👾",
 ]
+
 reply_list = [
-    "ᴄʜᴜᴘ ᴋᴀʀ ʀᴀɴᴅɪ ᴋᴇ 👾", "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴀᴀɢ 👾",
-    "ᴋʏᴀ ʀᴇ ᴄʜᴏᴅᴜ ʀᴇᴘʟʏ ᴅᴇ 👾", "ᴛᴇʀɪ ʙᴇʜᴇɴ ʀᴀɴᴅɪ ʜᴀɪ 👾",
-    "ᴛᴇʀᴀ ʙᴀᴀᴘ ʜᴜ ᴍᴀɪ 👾", "ɢᴀᴀɴᴅ ᴍᴀʀᴀ ᴀᴘɴɪ ᴍᴀᴅᴀʀᴄʜᴏᴅ 👾",
-    "ꜱʜᴀᴋᴀʟ ᴅᴇᴋʜ ᴀᴘɴɪ 👾", "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ʙʜᴇᴊ ᴍᴇʀᴇ ᴘᴀᴀꜱ 👾",
-    "ᴄʜᴜᴅ ᴊᴀ ᴄʜᴜᴘᴄʜᴀᴘ 👾", "ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴇ ʟᴜɴᴅ 👾",
-    "ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ 👾", "ᴛᴇʀɪ ᴍᴀᴀ ᴄʜᴜᴅ ʀᴀʜɪ ʜᴀɪ 👾",
-    "ᴋʏᴀ ʀᴇ ɢᴀɴᴅᴜ 👾", "ᴛᴇʀᴀ ᴋʜᴀɴᴅᴀɴ ʀᴀɴᴅɪ ᴋʜᴀɴᴀ 👾",
-    "ᴀᴀ ᴊᴀ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀᴀʀᴜ 👾",
+    "𝐊ʸᴀ 𝐑ᴇ 𝐓ᴇʀɪ 𝐂ᴏᴏʟ 𝐁ᴀᴛᴇ𝐇 ᴛᴜ 𝐂ʜᴏᴅ 𝐀ᴘɴɪ 𝐁ᴇᴇɴ ᴛᴇxxᴛ 𝐒ᴇ 👾",
+    "𝐉ɪ 𝐌ᴏᴏ 𝐌ᴏᴏᴋ 𝐆ᴏʟɪ 𝐘ᴏᴏᴋ - 𝐉ᴇ 𝐓ᴇxxᴛ 👾",
+    "acha beta ? coi na me toh HATER codunga 👾",
+    "chudke bhaga kaise 👾",
+    "ne toh 𝐓ᴇxxᴛ ka lun muh me lelia 👾",
+    "try maa सूर्य nikalte hi pel du 👾",
+    "mkl lun te vaj 👾",
+    "𝑻ᴏʟᴇ pe 𝐓ᴇxxᴛ ka hamla 👾",
+    "𝐂ʜʜ 𝐍ᴇᴋᴏᴜᴛᴇ 𝐉ᴇ लड़के 👾",
+    "oi 𝐓ᴇʀɪ 𝐌‐ᴏᴏ गुलाम 👾",
+    "chl rndyce chud ke dikha 👾",
+    "𝐉ɪ 𝐌ᴏᴏ 𝐌ᴏᴏᴋ 𝐆ᴏʟɪ naacho 👾",
+    "tera baap bass 𝐓ᴇxxᴛ hai 👾",
+    "try maa hagte hue paad mari 👾",
+    "𝐓ᴇʀɪ 𝐌‐ᴏᴏᴋ 𝐂ʜᴏᴅ 𝐃ɪ 𝐓ᴇxxᴛ 𝐍ᴇ 𝐁ʜᴇᴇᴄʜᴇ 𝐁ʜᴇᴇᴄʜᴇ 👾",
 ]
+
 reply_texts = [
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʟᴜɴᴅ ᴅᴀᴀʟ ᴅᴜɴɢᴀ 👾",
-    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ʀᴏᴢ ᴄʜᴏᴅᴛᴀ ʜᴜ ᴍᴀɪ 👾",
-    "ᴀᴘɴɪ ᴍᴀᴀ ᴋᴏ ʙᴏʟ ᴋᴇ ᴀᴀ 👾",
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴍᴇʀᴇ ᴘᴀᴀꜱ ʙʜᴇᴊ 👾",
-    "ᴄʜᴜᴘ ᴋᴀʀ ᴡʀɴᴀ ɢᴀᴀɴᴅ ᴍᴀʀ ᴅᴜɴɢᴀ 👾",
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ɢᴀᴀɴᴅ ᴄʜᴀᴛ ᴅᴜɴɢᴀ 👾",
-    "ʟᴜɴᴅ ᴘᴇ ʙᴀɪᴛʜ ᴊᴀ 👾",
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴅᴀɪ ᴅᴇᴋʜ ʟᴇ ᴀᴘɴɪ 👾",
-    "ɢᴀɴᴅᴜ ᴋᴀʜɪ ᴋᴀ 👾",
-    "ꜱʜᴀᴋᴀʟ ꜱᴇ ʜɪ ʀᴀɴᴅɪ ʟᴀɢᴛᴀ ʜᴀɪ 👾",
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ꜱᴀᴍʙʜᴀʟ ᴋᴇ ʀᴀᴋʜ 👾",
-    "ᴍᴀᴀ ᴄʜᴜᴅᴀ ᴀᴘɴɪ ʏᴀʜᴀ ꜱᴇ 👾",
+    "𝐂ʸбᴌ 𝐓ᴇ मदरचोद 𝐓ᴇxxᴛ बाप के सामने 𝐅ʸʟᴇК 𝐁ᴇЙч 👾",
+    "नहीं नहीं तेरी मां को 𝐓ʀᴇᴛ𝐬 𝐓ᴇxxᴛ बाप चोद सकता है ४४४४४ sᴇ ʀᴇᴀᴅʏ ??? 👾",
+    "तेरी मां का 𝐓ʀᴇᴛ𝐬 भोसड़ा 👾",
+    "𝐓ʏᴘᴇ sᴏᴏɴ ʀᴇᴀᴅʏ 𝐓ᴇʀᴀ 𝐃ᴀᴅᴅʏ 𝐊ᴀ 𝐁ᴀᴀᴘ 𝐌ᴇʀᴀ 𝐆ᴜʟᴀᴍ 👾",
+    "सोच तेरी बहन को 𝐓ᴇxxᴛ बाप का गुलाम चोद रहा 👾",
+    "Hello hello?? Oxygen aarahi है? रण्डी पुत्र 👾",
+    "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन 𝐓ᴇxxᴛ /\\~ बाप से सही chudi 👾",
+    "ʜᴍ ʜᴇʀᴇ ʜᴇʀᴇ ʙʟᴏᴏᴅʏ ᴛᴇxxᴛ ᴋᴇ ʙᴀᴀᴘ ᴋᴇ ʜᴀʀᴇᴍ sᴇ ᴋᴏɪ ᴛᴏ ʜᴇʀᴇ ʀᴀɴᴅɪ ᴛᴇʀɪ मां घर घर जाके MOAN करती है ! 👾",
+    "मां चूदा अपनी यहा से 👾",
+    "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 👾",
+    "𝐓ᴇʀᴋ 𝐁ʜᴇ𝐍 𝐉ᴇ ʸᴏᴏᴍᴍʏ 👾",
+    "₹☼ ₹𝐉ɪбᴇ 𝐍ᴇʟ 𝐆ᴏʟᴋ 𝐓ᴇʀᴋ 𝐌ᴏᴏ 𝐉ᴏ 𝐂ʜᴏᴅЙᴇ मेरी रेलगाड़ी आ रही 👾",
+    "𝐓ᴇʀᴋ 𝐌ᴏ 𝐉ᴏ 𝐂ʜɪК𝐍 𝐏ᴏᴙ 𝐓ᴇ𝐖ᴇЙ 𝐍ᴏ 𝐀𝐊 𝐓ᴏ 𝐒ɪᴙᴇ 𝐕ɪКᴇ 𝐍ᴏЙᴇ 𝐘ᴇ 👾",
 ]
+
 fun_texts = [
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴇ ʙʜᴏꜱᴅᴇ ᴍᴇ ᴍᴇʀᴀ ʟᴜɴᴅ ꜰᴀꜱ ɢᴀʏᴀ 👾",
-    "ᴋʏᴀ ʀᴇ ᴄʜᴏᴅᴜ ʀᴇᴘʟʏ ɴᴀʜɪ ᴋᴀʀ ʀᴀʜᴀ 👾",
-    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ᴄʜᴏᴅ ᴄʜᴜᴋᴀ ʜᴜ ᴍᴀɪ 👾",
-    "ᴀᴘɴɪ ᴍᴀᴀ ᴋɪ ꜱʜᴀᴋᴀʟ ᴅᴇᴋʜ ʟᴇ 👾",
-    "ɢᴀᴀɴᴅ ᴍᴀʀᴀ ʟᴇ ᴀᴘɴɪ 👾",
-    "ᴋʏᴀ ʀᴇ ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ 👾",
-    "ᴄʜᴜᴅ ᴊᴀ ʙʜᴀɪ ᴄʜᴜᴘᴄʜᴀᴘ 👾",
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴀᴀɢ ʟᴀɢᴀ ᴅᴜɴɢᴀ 👾",
+    "𝐊ʸᴀ 𝐑ᴇ 𝐓ᴇʀɪ 𝐂ᴏᴏʟ 𝐁ᴀᴛᴇ𝐇 ᴛᴜ 𝐂ʜᴏᴅ 𝐀ᴘɴɪ 𝐁ᴇᴇɴ 𝐓ᴇxxᴛ 𝐒ᴇ 👾",
+    "𝐉ɪ 𝐌ᴏᴏ 𝐌ᴏᴏᴋ 𝐆ᴏʟɪ 𝐘ᴏᴏᴋ - 𝐉ᴇ 𝐓ᴇxxᴛ ! 👾",
+    "acha beta ? coi na me toh HATER codunga 👾",
+    "chudke bhaga kaise 👾",
+    "ne toh 𝐓ᴇxxᴛ ka lun muh me lelia 👾",
+    "try maa सूर्य nikalte hi pel du 👾",
+    "mkl lun te vaj 👾",
+    "𝑻ᴏʟᴇ pe 𝐓ᴇxxᴛ ka hamla 👾",
+    "oi 𝐓ᴇʀɪ 𝐌‐ᴏᴏ गुलाम 👾",
+    "chl rndyce chud ke dikha 👾",
+    "𝐉ɪ 𝐌ᴏᴏ 𝐌ᴏᴏᴋ 𝐆ᴏʟɪ naacho 👾",
+    "tera baap bass 𝐓ᴇxxᴛ hai 👾",
+    "𝐓ᴇʀɪ 𝐌‐ᴏᴏᴋ 𝐂ʜᴏᴅ 𝐃ɪ 𝐓ᴇxxᴛ 𝐍ᴇ 𝐁ʜᴇᴇᴄʜᴇ 𝐁ʜᴇᴇᴄʜᴇ 👾",
 ]
+
 flag_texts = [
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʜᴀᴍʟᴀ ᴋᴀʀ ᴅᴜɴɢᴀ 👾",
-    "ᴀᴘɴɪ ᴍᴀᴀ ᴋᴏ ꜱᴀᴍʙʜᴀʟ ᴋᴇ ʀᴀᴋʜ 👾",
-    "ʙᴏʟ ᴋʏᴀ ᴘʀᴏʙʟᴇᴍ ʜᴀɪ 👾",
-    "ᴋʏᴀ ʀᴇ ɢᴀɴᴅᴜ 👾",
-    "ᴍᴀᴀ ᴄʜᴜᴅᴀ ᴀᴘɴɪ 👾",
-    "ᴄʜᴜᴅ ᴊᴀ ᴄʜᴜᴘᴄʜᴀᴘ 👾",
-    "ᴀᴀ ᴊᴀ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀᴀʀᴜ 👾",
-    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴀɪꜱɪ ʜᴀɪ 👾",
+    "𝐊ʸᴀ 𝐑ᴇ 𝐓ᴇʀɪ 𝐂ᴏᴏʟ 𝐁ᴀᴛᴇ𝐇 ᴛᴜ 𝐂ʜᴏᴅ 𝐀ᴘɴɪ 𝐁ᴇᴇɴ 𝐓ᴇxxᴛ 𝐒ᴇ 👾",
+    "𝐉ɪ 𝐌ᴏᴏ 𝐌ᴏᴏᴋ 𝐆ᴏʟɪ 𝐘ᴏᴏᴋ - 𝐉ᴇ 𝐓ᴇxxᴛ 👾",
+    "acha beta ? coi na me toh HATER codunga 👾",
+    "chudke bhaga kaise 👾",
+    "ne toh 𝐓ᴇxxᴛ ka lun muh me lelia 👾",
+    "try maa सूर्य nikalte hi pel du 👾",
+    "mkl lun te vaj 👾",
+    "𝑻ᴏʟᴇ pe 𝐓ᴇxxᴛ ka hamla 👾",
+    "𝐂ʜʜ 𝐍ᴇᴋᴏᴜᴛᴇ 𝐉ᴇ लड़के 👾",
+    "oi 𝐓ᴇʀɪ 𝐌‐ᴏᴏ गुलाम 👾",
+    "chl rndyce chud ke dikha 👾",
+]
+
+heart_replies = [
+    "ᴋᴜᴄʜ ᴛᴏ ʙᴏʟ ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ʙʜᴏꜱᴅᴀ 👾",
+    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴘʏᴀʀ 👾",
+    "ᴍᴀᴀ ᴄʜᴜᴅᴀ ᴀᴘɴɪ ʏᴀʜᴀ ꜱᴇ 👾",
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ʀᴀɴᴅɪ ʙᴀɴᴀ ᴅɪʏᴀ 👾",
+    "ᴛᴇʀᴇ ʙᴀᴀᴘ ᴋᴀ ɴᴀᴀᴍ ʟᴇᴋᴇ ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴄʜᴏᴅ ᴅᴜɴɢᴀ 👾",
+    "ᴋʏᴀ ʀᴇ ʀᴀɴᴅɪ ᴋᴇ ʀᴇᴘʟʏ ɴᴀʜɪ ᴋᴀʀᴛᴀ 👾",
+    "ᴛᴇʀᴀ ʙᴀᴀᴘ ʜᴜ ᴍᴀɪ ᴄʜᴜᴘ ᴋᴀʀ ʀᴀɴᴅɪᴋᴇ 👾",
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴀᴀɢ ʟᴀɢᴀ ᴋᴇ ʀᴀᴀᴋʜ ᴋᴀʀ ᴅᴜɴɢᴀ 👾",
+    "ᴇᴋ ᴍᴇꜱꜱᴀɢᴇ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ʟᴀꜱʜ ɢᴀʟɪ ᴍᴇ ᴘᴀᴅɪ ʜᴏɢɪ 👾",
+    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʟᴜɴᴅ ᴅᴀᴀʟ ᴅᴜɴɢᴀ 👾",
+    "ᴛᴇʀᴀ ᴋʜᴀɴᴅᴀɴ ᴋʜᴀᴛᴍ ᴛᴇʀɪ ᴍᴀᴀ ꜱᴇ ꜱʜᴜʀᴜ ʜᴏᴛᴀ ʜᴀɪ 👾",
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴄʜᴏᴅ ᴋᴇ ᴋᴏᴛʜɪ ᴍᴇ ꜰᴇᴋ ᴀᴀᴜɴɢᴀ 👾",
+    "ᴋʏᴀ ʀᴇ ᴍᴀᴅᴀʀᴄʜᴏᴅ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴇ ᴍᴇʀᴀ ʟᴜɴᴅ ɢʜᴜꜱᴀ ᴅᴜɴɢᴀ 👾",
+    "ᴛᴇʀᴇ ᴋʜᴀɴᴅᴀɴ ᴋɪ ʟᴀꜱʜ ᴋᴏ ɢᴀʟɪ ɢᴀʟɪ ɢʜᴜᴍᴀᴜɴɢᴀ 👾",
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴍᴇʀᴀ ʙᴇᴛᴀ ʜᴀɪ ᴊᴀɴᴛᴀ ʜᴀɪ ᴋʏᴀ 👾",
+    "ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ ᴀᴋᴀʟ ᴀᴀᴛɪ ᴛᴏ ʙᴏʟ ᴡʀɴᴀ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀᴀʀ ᴅᴜɴɢᴀ 👾",
 ]
 
 
-# ---------- yt-dlp YouTube bypass ----------
+# ---------- yt-dlp YouTube 2026 bypass ----------
 def _ydl_youtube_opts(base: dict) -> dict:
-    """Add YouTube bot-check bypass + cookie attach to yt-dlp opts dict."""
+    """YouTube 2026 anti-bot: EJS + POT + cookie-aware client order."""
     opts = dict(base)
+
     ea = opts.setdefault("extractor_args", {})
     ea["youtube"] = {
-        "player_client": ["android", "web_safari", "ios", "web"],
-        "player_skip": ["webpage", "configs"],
+        "player_client": ["tv", "web", "android_vr", "ios"],
+        "player_skip":   ["webpage", "configs"],
     }
-    # cookies.txt — check DATA_DIR first (Railway volume), then BASE_DIR
+
+    opts.setdefault("force_ipv4",        True)
+    opts.setdefault("socket_timeout",    20)
+    opts.setdefault("extractor_retries", 3)
+    opts.setdefault("http_headers", {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+
     for ck_dir in (DATA_DIR, BASE_DIR):
         ck = ck_dir / "cookies.txt"
         if ck.exists():
             opts["cookiefile"] = str(ck)
             break
-    # cookies_from_browser.txt fallback
     for cf_dir in (DATA_DIR, BASE_DIR):
         cf = cf_dir / "cookies_from_browser.txt"
         if cf.exists():
@@ -349,7 +414,6 @@ def _ffmpeg_available() -> bool:
 
 
 def _mp3_to_ogg_opus(mp3_path: str) -> Optional[str]:
-    """Transcode mp3 → ogg/opus for Telegram voice note. Returns path or None."""
     if not _ffmpeg_available():
         return None
     ogg_path = str(Path(mp3_path).with_suffix(".ogg"))
@@ -379,23 +443,6 @@ def is_admin(uid: Optional[int]) -> bool:
 def is_user_muted(chat_id: int, user_id: int) -> bool:
     if user_id in global_muted: return True
     return chat_id in muted_users and user_id in muted_users[chat_id]
-
-
-def _extract_user_id(msg) -> Optional[int]:
-    try:
-        fid = getattr(msg, "from_id", None)
-        if fid is not None:
-            uid = getattr(fid, "user_id", None)
-            if uid: return int(uid)
-            cid = getattr(fid, "channel_id", None)
-            if cid: return -int(cid)
-        pid = getattr(msg, "peer_id", None)
-        if pid is not None:
-            uid = getattr(pid, "user_id", None)
-            if uid: return int(uid)
-    except Exception:
-        pass
-    return None
 
 
 async def _ensure_our_bot_ids():
@@ -568,6 +615,9 @@ async def run_with_flood_retry(coro_factory, event, cmd_name: str):
         await safe_edit(event, f"👾 {type(e).__name__}: {str(e)[:100]}")
 
 
+# ------------------------------------------------------------------
+#  MENU
+# ------------------------------------------------------------------
 MENU_TEXT = f"""
 ╔══════════════════════════════╗
       👾   {BRAND}   👾
@@ -594,18 +644,13 @@ MENU_TEXT = f"""
 
 ╭━━━━━ 👾 𝐑𝐀𝐈𝐃 ━━━━━━╮
 ┃ 👾 .reply / .rr / .flag / .replyshadow
-┃ 👾 .sreply / .srr / .sflag / .sshadow
+┃ 👾 .hrr / .replygod
+┃ 👾 .sreply / .srr / .sflag / .sshadow / .shr
 ┃ 👾 .raid / .swipe / .sraid / .sswipe
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐒𝐏𝐀𝐌 ━━━━━━╮
 ┃ 👾 .spray / .dspray / .fastgc
-╰━━━━━━━━━━━━━━━━━━━━╯
-
-╭━━━━━ 👾 𝐂𝐋𝐄𝐀𝐑 ━━━━━╮
-┃ 👾 .clear on/off       » GC name/photo spam
-┃ 👾 .clear bots on/off  » other bots' text
-┃ 👾 .botid <username>   » own-bot cache
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐒𝐍𝐈𝐏𝐄 ━━━━━╮
@@ -614,6 +659,7 @@ MENU_TEXT = f"""
 
 ╭━━━━━ 👾 𝐓𝐎𝐎𝐋𝐒 ━━━━━╮
 ┃ 👾 .dl / .music / .voice / .weather
+┃ 👾 .clear on/off  » auto-delete GC changes
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐏𝐑𝐎𝐅𝐈𝐋𝐄 ━━━╮
@@ -1025,6 +1071,11 @@ async def cmd_rr(event, arg):          await _toggle_target(event, arg, rr_users
 async def cmd_flag(event, arg):        await _toggle_target(event, arg, flag_users,        "flag")
 @register_cmd("replyshadow", needs_reply=True)
 async def cmd_replyshadow(event, arg): await _toggle_target(event, arg, replyshadow_users, "shadow")
+@register_cmd("replygod",    needs_reply=True)
+async def cmd_replygod(event, arg):    await _toggle_target(event, arg, replyshadow_users, "replygod")
+@register_cmd("hrr",         needs_reply=True)
+async def cmd_hrr(event, arg):         await _toggle_target(event, arg, hrr_users,         "heart raid")
+
 @register_cmd("sreply")
 async def cmd_sreply(event, arg):      await _stop_target(event, arg, reply_users,       "reply raid")
 @register_cmd("srr")
@@ -1033,6 +1084,8 @@ async def cmd_srr(event, arg):         await _stop_target(event, arg, rr_users, 
 async def cmd_sflag(event, arg):       await _stop_target(event, arg, flag_users,        "flag")
 @register_cmd("sshadow")
 async def cmd_sshadow(event, arg):     await _stop_target(event, arg, replyshadow_users, "shadow")
+@register_cmd("shr")
+async def cmd_shr(event, arg):         await _stop_target(event, arg, hrr_users,         "heart raid")
 
 async def _raid_worker(chat, reply_to_id: int, chat_id: int):
     try:
@@ -1247,9 +1300,6 @@ async def cmd_dl(event, arg):
                 "quiet": True, "no_warnings": True,
                 "nocheckcertificate": True, "retries": 5,
                 "noplaylist": False, "ignoreerrors": True,
-                "user_agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                               "AppleWebKit/537.36 (KHTML, like Gecko) "
-                               "Chrome/120.0.0.0 Safari/537.36"),
             })
             def run():
                 with yt_dlp.YoutubeDL(opts) as ydl: return ydl.extract_info(url, download=True)
@@ -1275,7 +1325,7 @@ async def cmd_dl(event, arg):
             await safe_edit(event, f"👾 {str(e)[:120]}")
     asyncio.create_task(dl_task())
 
-# ---------- .music — fixed ----------
+# ---------- .music — YouTube 2026 hardened ----------
 @register_cmd("music")
 async def cmd_music(event, arg):
     if not arg: return await safe_edit(event, "Use: .music <song>")
@@ -1355,16 +1405,28 @@ async def cmd_music(event, arg):
         except Exception as e:
             LOG.warning(f"music: {e}\n{traceback.format_exc()}")
             err = str(e)
-            if "Sign in to confirm" in err or "bot" in err.lower():
+            if "Sign in to confirm" in err or "bot" in err.lower() and "youtube" in err.lower():
                 await safe_edit(event,
-                    "👾 YouTube bot-check hit.\n"
-                    "▸ Fix: export browser cookies → save as `cookies.txt`\n"
-                    "▸ Put it in DATA_DIR (Railway: /data) or next to shadow_all.py\n"
-                    "▸ Or: `cookies_from_browser.txt` with `chrome` / `edge` / `firefox`")
+                    "👾 YouTube bot-check.\n"
+                    "▸ 1) pip install -U yt-dlp-ejs bgutil-ytdlp-pot-provider\n"
+                    "▸ 2) install deno (JS runtime)\n"
+                    "▸ 3) restart the userbot\n"
+                    "▸ 4) if still fails: cookies.txt in DATA_DIR\n"
+                    "▸ check: .health")
+            elif "PO Token" in err or "GVS" in err:
+                await safe_edit(event,
+                    "👾 PO Token missing.\n"
+                    "▸ pip install -U bgutil-ytdlp-pot-provider\n"
+                    "▸ node >= 22 or deno >= 2.0")
+            elif "n challenge" in err or "JS runtime" in err:
+                await safe_edit(event,
+                    "👾 n-challenge solver missing.\n"
+                    "▸ pip install -U yt-dlp-ejs\n"
+                    "▸ install deno or node")
             elif "Requested format is not available" in err:
                 await safe_edit(event,
-                    "👾 Format selector miss — video has no bestaudio/best stream.\n"
-                    "▸ Retry with .dl <url> to pull the raw file")
+                    "👾 Format selector miss.\n"
+                    "▸ retry with .dl <url> to grab the raw file")
             else:
                 await safe_edit(event, f"Music error: {err[:120]}")
         finally:
@@ -1547,6 +1609,7 @@ async def cmd_status(event, _):
            f"▸ swipes : {len(swipe_tasks)}\n▸ mode   : operational\n"
            f"▸ clear  : service={'ON' if ST.data.get('auto_clear_titles') else 'OFF'} "
            f"bots={'ON' if ST.data.get('auto_clear_bot_msgs') else 'OFF'}\n"
+           f"▸ hrr    : {len(hrr_users)} targets\n"
            f"▸ our bots cached: {len(_our_bot_ids_cache)}")
     await safe_edit(event, txt)
 
@@ -1575,13 +1638,25 @@ async def cmd_health(event, _):
         results.append(f"▸ yt-dlp   : {_y.version.__version__}")
     except Exception:
         results.append("▸ yt-dlp   : FAIL")
+    try:
+        import yt_dlp_ejs as _ejs  # noqa
+        results.append("▸ yt-dlp-ejs : yes")
+    except Exception:
+        results.append("▸ yt-dlp-ejs : NO (pip install yt-dlp-ejs)")
+    try:
+        import bgutil_ytdlp_pot_provider as _pot  # noqa
+        results.append("▸ pot plugin : yes")
+    except Exception:
+        results.append("▸ pot plugin : NO (pip install bgutil-ytdlp-pot-provider)")
+    results.append(f"▸ deno     : {'yes' if shutil.which('deno') else 'NO'}")
+    results.append(f"▸ node     : {'yes' if shutil.which('node') else 'NO'}")
     results.append(f"▸ ffmpeg   : {'yes' if _ffmpeg_available() else 'NO (voice-note fallback = mp3)'}")
+    ck = DATA_DIR / "cookies.txt"
+    results.append(f"▸ cookies  : {'yes' if ck.exists() else 'no'}")
     results.append(f"▸ our bots : {len(_our_bot_ids_cache)} cached")
     results.append(f"▸ me       : {_my_userbot_id}")
     results.append(f"▸ data dir : {DATA_DIR}")
     results.append(f"▸ queue    : {_nuke_queue.qsize()} pending")
-    ck = DATA_DIR / "cookies.txt"
-    results.append(f"▸ cookies  : {'yes' if ck.exists() else 'no'}")
     txt = "👾 health 👾\n" + "\n".join(results)
     await safe_edit(event, txt)
 
@@ -1611,7 +1686,7 @@ async def cmd_restore(event, _):
         ST.data = {**_DEFAULT_STATE, **data}
         ST.save()
         global admins, global_muted, group_locks, muted_users
-        global reply_users, rr_users, flag_users, replyshadow_users
+        global reply_users, rr_users, flag_users, replyshadow_users, hrr_users
         global menu_banner_msg, auto_react_emoji
         admins = set(int(x) for x in ST.data.get("admins", []))
         global_muted = set(int(x) for x in ST.data.get("gmutes", []))
@@ -1622,6 +1697,7 @@ async def cmd_restore(event, _):
         rr_users          = set(int(x) for x in ST.data.get("rr_targets", []))
         flag_users        = set(int(x) for x in ST.data.get("flag_targets", []))
         replyshadow_users = set(int(x) for x in ST.data.get("shadow_targets", []))
+        hrr_users         = set(int(x) for x in ST.data.get("hrr_targets", []))
         menu_banner_msg = tuple(ST.data["banner"]) if ST.data.get("banner") else None
         auto_react_emoji = ST.data.get("auto_react")
         await safe_edit(event, "👾 Restored")
@@ -1632,7 +1708,7 @@ async def cmd_restore(event, _):
 async def cmd_reload(event, _):
     ST.load()
     global admins, global_muted, group_locks, muted_users
-    global reply_users, rr_users, flag_users, replyshadow_users
+    global reply_users, rr_users, flag_users, replyshadow_users, hrr_users
     global menu_banner_msg, auto_react_emoji
     admins = set(int(x) for x in ST.data.get("admins", []))
     global_muted = set(int(x) for x in ST.data.get("gmutes", []))
@@ -1643,6 +1719,7 @@ async def cmd_reload(event, _):
     rr_users          = set(int(x) for x in ST.data.get("rr_targets", []))
     flag_users        = set(int(x) for x in ST.data.get("flag_targets", []))
     replyshadow_users = set(int(x) for x in ST.data.get("shadow_targets", []))
+    hrr_users         = set(int(x) for x in ST.data.get("hrr_targets", []))
     menu_banner_msg = tuple(ST.data["banner"]) if ST.data.get("banner") else None
     auto_react_emoji = ST.data.get("auto_react")
     await safe_edit(event, "👾 Reloaded from disk")
@@ -1700,6 +1777,7 @@ async def cmd_stopall(event, _):
     if rr_users:          rr_users.clear();          stopped.append("rr")
     if flag_users:        flag_users.clear();        stopped.append("flag")
     if replyshadow_users: replyshadow_users.clear(); stopped.append("shadow")
+    if hrr_users:         hrr_users.clear();         stopped.append("hrr")
     if auto_react_emoji:  auto_react_emoji = None;   stopped.append("ar")
     if group_locks:       group_locks.clear();       stopped.append("locks")
     if muted_users:       muted_users.clear();       stopped.append("mutes")
@@ -1715,38 +1793,35 @@ async def cmd_stopall(event, _):
     txt = ("👾 Everything stopped\n" + ", ".join(stopped)) if stopped else "👾 Nothing was active"
     await safe_edit(event, txt)
 
-# ---------- .clear — rewritten, no exceptions ----------
+# ---------- .clear ----------
 @register_cmd("clear")
 async def cmd_clear(event, arg):
     arg = (arg or "").strip().lower()
 
+    # hidden subcommand — other bots' text nuke
     if arg.startswith("bots"):
         sub = arg[4:].strip()
-        if sub == "on":   state = True
+        if sub == "on":    state = True
         elif sub == "off": state = False
         else:              state = not ST.data.get("auto_clear_bot_msgs", False)
         ST.data["auto_clear_bot_msgs"] = state
         ST.save()
         return await safe_edit(
             event,
-            f"👾 nuke other-bots' text msgs ➤ {'ON' if state else 'OFF'}\n"
-            f"▸ target : every bot EXCEPT our SHADOW bots, owner, admins\n"
-            f"▸ use    : `.clear bots on` / `.clear bots off`",
+            f"👾 other-bots nuke ➤ {'ON' if state else 'OFF'}\n"
+            f"▸ every bot EXCEPT SHADOW bots, owner, admins",
         )
 
-    if arg in ("on", "off"):
-        state = (arg == "on")
-    else:
-        state = not ST.data.get("auto_clear_titles", False)
+    if arg == "on":    state = True
+    elif arg == "off": state = False
+    else:              state = not ST.data.get("auto_clear_titles", False)
     ST.data["auto_clear_titles"] = state
     ST.save()
     await safe_edit(
         event,
-        f"👾 GC name/photo auto-clear ➤ {'ON' if state else 'OFF'}\n"
-        f"▸ scope  : every title change + photo change service msg\n"
-        f"▸ who    : EVERYONE — no whitelist, no exceptions\n"
-        f"▸ speed  : batched, ~30ms flush window\n"
-        f"▸ use    : `.clear on` / `.clear off`",
+        f"👾 GC auto-clear ➤ {'ON' if state else 'OFF'}\n"
+        f"▸ deletes : every service msg (title, photo, pin, join, leave, TTL, theme)\n"
+        f"▸ use     : `.clear on` / `.clear off`",
     )
 
 @register_cmd("botid")
@@ -1761,7 +1836,7 @@ async def cmd_botid(event, arg):
         uid = int(ent.id)
         _our_bot_ids_cache.add(uid)
         _our_bot_cache_loaded = True
-        await safe_edit(event, f"✅ Added to our-bots cache:\n@{uname} → `{uid}`\nTotal: {len(_our_bot_ids_cache)}")
+        await safe_edit(event, f"✅ cached:\n@{uname} → `{uid}`\nTotal: {len(_our_bot_ids_cache)}")
     except Exception as e:
         await safe_edit(event, f"❌ {str(e)[:80]}")
 
@@ -1803,6 +1878,7 @@ async def cmd_info(event, arg):
 
 # ---------- userbot event handlers ----------
 if bot is not None:
+
     @bot.on(events.NewMessage)
     async def on_new_incoming(event):
         if event.out: return
@@ -1870,6 +1946,9 @@ if bot is not None:
             if sender in reply_users:
                 try: await event.reply(random.choice(reply_list))
                 except Exception: pass
+            if sender in hrr_users:
+                try: await event.reply(random.choice(heart_replies))
+                except Exception: pass
             if sender in replyshadow_users:
                 try:
                     for _ in range(3):
@@ -1925,31 +2004,23 @@ if bot is not None:
                 reaction=[ReactionEmoji(emoticon=e)]))
         except Exception: pass
 
-    _SERVICE_ACTIONS = (
-        types.MessageActionChatEditTitle,
-        types.MessageActionChatEditPhoto,
-        types.MessageActionChatDeletePhoto,
-        types.MessageActionChannelCreate,
-        types.MessageActionChatCreate,
-    )
-
-    @bot.on(events.Raw(types=[
-        types.UpdateNewChannelMessage,
-        types.UpdateNewMessage,
-        types.UpdateEditChannelMessage,
-        types.UpdateEditMessage,
-    ]))
+    # ------------------------------------------------------------------
+    #  .clear — fires on every service message
+    # ------------------------------------------------------------------
+    @bot.on(events.NewMessage)
     async def on_service_clear(event):
         if not ST.data.get("auto_clear_titles"):
             return
-        msg = getattr(event, "message", None)
-        if not isinstance(msg, types.MessageService):
+        if getattr(event, "action", None) is None:
             return
-        action = getattr(msg, "action", None)
-        if not isinstance(action, _SERVICE_ACTIONS):
-            return
-        # no whitelist — every title/photo change msg dies
-        _nuke_queue.put_nowait((msg.peer_id, msg.id))
+        try:
+            await event.delete()
+        except FloodWaitError as fw:
+            await asyncio.sleep(min(fw.seconds, 2.0))
+            try: await event.delete()
+            except Exception: pass
+        except Exception:
+            pass
 
     @bot.on(events.NewMessage(outgoing=True))
     async def on_command(event):
@@ -2364,9 +2435,8 @@ async def _finalize(update, context, chat_id: int):
         "✅ Login successful.\n\n"
         "Your userbot is now running 24/7.\n"
         "Try `.menu` in any chat.\n\n"
-        "`.clear on` → nuke every GC name/photo change msg (no whitelist).\n"
-        "`.clear bots on` → also nuke other bots' text msgs.\n"
-        "`.music <song>` → downloads + sends as voice note (needs ffmpeg).\n\n"
+        "`.clear on` → auto-delete every GC service msg (title/photo/pin/join).\n"
+        "`.music <song>` → downloads + sends as voice note (needs ffmpeg + deno).\n\n"
         "Press the button below to log out completely.",
         reply_markup=kb,
     )
