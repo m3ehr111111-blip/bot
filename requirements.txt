@@ -1,7 +1,6 @@
 python-telegram-bot>=21
 telethon
 yt-dlp
-yt-dlp-ejs
-bgutil-ytdlp-pot-provider
 gTTS
 requests
+edge-tts
