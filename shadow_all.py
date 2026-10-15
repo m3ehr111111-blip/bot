@@ -2,11 +2,8 @@
 # language: Python 3.10+
 # file: shadow_all.py
 # target: Windows cmd / Linux / Termux / Railway (Docker)
-# deps: pip install "python-telegram-bot>=21" telethon yt-dlp gTTS requests
-#       ffmpeg optional (voice-note transcode)
-#
-# MODE A:  python shadow_all.py                          → onboarding bot
-# MODE B:  python shadow_all.py --userbot <chat_id>      → userbot
+# deps: pip install "python-telegram-bot>=21" telethon yt-dlp gTTS requests edge-tts
+#       ffmpeg required for voice-note extraction from video
 
 import asyncio
 import atexit
@@ -80,11 +77,30 @@ try:
     from telethon.tl.functions.photos import (
         UploadProfilePhotoRequest, DeletePhotosRequest,
     )
-    from telethon.tl.types import ChatAdminRights, ReactionEmoji
+    from telethon.tl.types import (
+        ChatAdminRights, ReactionEmoji,
+        DocumentAttributeAudio, DocumentAttributeVideo,
+    )
 except Exception as e:
     print(f"missing dep: {e}")
-    print('pip install "python-telegram-bot>=21" telethon yt-dlp gTTS requests')
+    print('pip install "python-telegram-bot>=21" telethon yt-dlp gTTS requests edge-tts')
     sys.exit(1)
+
+try:
+    import edge_tts
+    _EDGE_OK = True
+except Exception:
+    edge_tts = None
+    _EDGE_OK = False
+
+
+def _ffmpeg_ok() -> bool:
+    try:
+        r = subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 # ==================================================================
@@ -115,6 +131,7 @@ _DEFAULT_STATE = {
     "mutes":        {},
     "gmutes":       [],
     "locks":        [],
+    "muted_gcs":    [],
     "banner":       None,
     "reply_targets":  [],
     "rr_targets":     [],
@@ -165,6 +182,7 @@ ST = State(STATE_FILE)
 admins: Set[int]         = set(int(x) for x in ST.data.get("admins", []) if str(x).lstrip("-").isdigit())
 global_muted: Set[int]   = set(int(x) for x in ST.data.get("gmutes", []) if str(x).lstrip("-").isdigit())
 group_locks: Set[int]    = set(int(x) for x in ST.data.get("locks", []) if str(x).lstrip("-").isdigit())
+muted_gcs: Set[int]      = set(int(x) for x in ST.data.get("muted_gcs", []) if str(x).lstrip("-").isdigit())
 muted_users: Dict[int, Set[int]] = {
     int(k): set(int(u) for u in v)
     for k, v in ST.data.get("mutes", {}).items()
@@ -182,6 +200,7 @@ def persist():
     ST.data["admins"]         = sorted(admins)
     ST.data["gmutes"]         = sorted(global_muted)
     ST.data["locks"]          = sorted(group_locks)
+    ST.data["muted_gcs"]      = sorted(muted_gcs)
     ST.data["mutes"]          = {str(k): sorted(v) for k, v in muted_users.items() if v}
     ST.data["reply_targets"]  = sorted(reply_users)
     ST.data["rr_targets"]     = sorted(rr_users)
@@ -413,6 +432,59 @@ async def run_with_flood_retry(coro_factory, event, cmd_name: str):
         await safe_edit(event, f"👾 {type(e).__name__}: {str(e)[:100]}")
 
 
+# ─── edge-tts voices ───
+GIRL_VOICES = [
+    "hi-IN-SwaraNeural",
+    "en-IN-NeerjaNeural",
+    "en-US-AriaNeural",
+    "en-US-JennyNeural",
+    "en-GB-SoniaNeural",
+]
+BOY_VOICES = [
+    "hi-IN-MadhurNeural",
+    "en-IN-PrabhatNeural",
+    "en-US-GuyNeural",
+    "en-GB-RyanNeural",
+]
+
+async def _edge_save(text: str, voice: str, out_path: str) -> bool:
+    if not _EDGE_OK:
+        return False
+    try:
+        comm = edge_tts.Communicate(text, voice, rate="+4%", pitch="-2Hz", volume="+0%")
+        await comm.save(out_path)
+        return os.path.isfile(out_path) and os.path.getsize(out_path) > 0
+    except Exception as e:
+        LOG.warning(f"[voice] edge error: {e}")
+        return False
+
+
+async def _tts_send(event, text: str, voice: str):
+    fname = os.path.join(str(TMP_DIR), f"vn_{int(time.time())}.mp3")
+    ok = await _edge_save(text, voice, fname)
+    if not ok:
+        try:
+            lang = "hi" if voice.startswith("hi-") else "en"
+            gTTS(text=text[:5000], lang=lang, slow=False).save(fname)
+        except Exception as e:
+            return await safe_edit(event, f"👾 voice failed: {str(e)[:60]}")
+    target_id = None
+    if event.is_reply:
+        try:
+            r = await event.get_reply_message()
+            if r: target_id = r.id
+        except Exception: pass
+    try:
+        with open(fname, "rb") as fh:
+            data = BytesIO(fh.read()); data.name = "shadow.ogg"
+        await bot.send_file(event.chat_id, data, voice_note=True, reply_to=target_id)
+        try: await event.delete()
+        except Exception: pass
+    finally:
+        try: os.remove(fname)
+        except Exception: pass
+
+
 MENU_TEXT = f"""
 ╔══════════════════════════════╗
       👾   {BRAND}   👾
@@ -430,6 +502,7 @@ MENU_TEXT = f"""
 ╭━━━━━ 👾 𝐌𝐔𝐓𝐄 ━━━━━━╮
 ┃ 👾 .mute / .unmute / .gmute / .gunmute
 ┃ 👾 .mutelist / .lock / .unlock
+┃ 👾 .mutegc on/off   » mute whole GC
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐆𝐑𝐎𝐔𝐏 ━━━━━╮
@@ -460,7 +533,8 @@ MENU_TEXT = f"""
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐓𝐎𝐎𝐋𝐒 ━━━━━╮
-┃ 👾 .dl / .music / .voice / .weather
+┃ 👾 .dl / .music / .weather
+┃ 👾 .voice / .voicegirl / .voiceboy
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐏𝐑𝐎𝐅𝐈𝐋𝐄 ━━━╮
@@ -473,11 +547,12 @@ MENU_TEXT = f"""
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐅𝐔𝐍 ━━━━━━━╮
-┃ 👾 .flip / .dice / .info
+┃ 👾 .flip / .dice / .info / .heart
 ╰━━━━━━━━━━━━━━━━━━━━╯
 """.strip()
 
 
+# ---------- commands ----------
 @register_cmd("menu")
 async def cmd_menu(event, _):
     if event.out:
@@ -688,7 +763,37 @@ async def cmd_mutelist(event, _):
     if group_locks:
         for gid in list(group_locks): txt += f"▸ `{gid}`\n"
     else: txt += "▸ none\n"
+    txt += "\n👾 muted gc (mutegc):\n"
+    if muted_gcs:
+        for gid in list(muted_gcs): txt += f"▸ `{gid}`\n"
+    else: txt += "▸ none\n"
     await safe_edit(event, txt)
+
+@register_cmd("mutegc")
+async def cmd_mutegc(event, arg):
+    arg = (arg or "").strip().lower()
+    chat_id = event.chat_id
+    if not event.is_group:
+        return await safe_edit(event, "Group only")
+    if arg == "on":
+        if chat_id in muted_gcs:
+            return await safe_edit(event, "👾 This GC is already muted")
+        muted_gcs.add(chat_id); persist()
+        return await safe_edit(event,
+            "🔇 WHOLE GC MUTED\n"
+            "▸ every non-owner message auto-deletes\n"
+            "▸ admins can also talk (safe)\n"
+            "▸ stop with `.mutegc off`")
+    elif arg == "off":
+        if chat_id not in muted_gcs:
+            return await safe_edit(event, "👾 This GC is not muted")
+        muted_gcs.discard(chat_id); persist()
+        return await safe_edit(event, "🔊 GC unmuted")
+    else:
+        state = chat_id in muted_gcs
+        return await safe_edit(event,
+            f"👾 GC mute: {'ON' if state else 'OFF'}\n"
+            f"▸ use: `.mutegc on` / `.mutegc off`")
 
 @register_cmd("lock", group_only=True)
 async def cmd_lock(event, _):
@@ -1102,15 +1207,16 @@ def _ydl_youtube_opts(base: dict) -> dict:
 
 
 def _yt_dlp_try(query: str, out_dir: str) -> Optional[str]:
+    """Download best video+audio, return path to file."""
     import glob
     strategies = [
-        {"format": "bestaudio/best", "extractor_args": {"youtube": {
-            "player_client": ["android"], "player_skip": ["webpage"]}}},
-        {"format": "bestaudio/best", "extractor_args": {"youtube": {
-            "player_client": ["ios"], "player_skip": ["webpage"]}}},
-        {"format": "bestaudio/best", "extractor_args": {"youtube": {
-            "player_client": ["web_safari"]}}},
-        {"format": "bestaudio/best"},
+        {"format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+         "extractor_args": {"youtube": {"player_client": ["android"], "player_skip": ["webpage"]}}},
+        {"format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+         "extractor_args": {"youtube": {"player_client": ["ios"], "player_skip": ["webpage"]}}},
+        {"format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+         "extractor_args": {"youtube": {"player_client": ["web_safari"]}}},
+        {"format": "bestvideo+bestaudio/best"},
     ]
     for i, strat in enumerate(strategies):
         opts = _ydl_youtube_opts({
@@ -1118,7 +1224,8 @@ def _yt_dlp_try(query: str, out_dir: str) -> Optional[str]:
             "quiet": True, "no_warnings": True,
             "default_search": "ytsearch1",
             "noplaylist": True, "retries": 2,
-            "socket_timeout": 15,
+            "socket_timeout": 20,
+            "merge_output_format": "mp4",
             **strat,
         })
         try:
@@ -1127,45 +1234,31 @@ def _yt_dlp_try(query: str, out_dir: str) -> Optional[str]:
             if "entries" in info: info = info["entries"][0]
             vid = info.get("id")
             files = glob.glob(os.path.join(out_dir, f"vn_{vid}.*"))
-            files = [f for f in files if not f.endswith((".part", ".ytdl"))]
+            files = [f for f in files if not f.endswith((".part", ".ytdl", ".webp", ".jpg", ".png"))]
             if files:
-                return files[0]
+                return files[0], vid, info
         except Exception as e:
             LOG.warning(f"yt-dlp strategy {i} failed: {str(e)[:80]}")
             continue
-    return None
+    return None, None, None
 
 
-def _invidious_fallback(query: str, out_dir: str) -> Optional[str]:
-    instances = [
-        "https://inv.nadeko.net",
-        "https://yewtu.be",
-        "https://invidious.nerdvpn.de",
-        "https://inv.tux.pizza",
-    ]
+def _extract_voice_ogg(video_path: str, out_ogg: str) -> bool:
+    """Extract audio track from video and produce ogg/opus for voice note."""
+    if not _ffmpeg_ok():
+        return False
     try:
-        r = requests.get(
-            f"https://invidious.nerdvpn.de/api/v1/search?q={requests.utils.quote(query)}&type=video",
-            timeout=10).json()
-        if not r: return None
-        vid = r[0].get("videoId")
-        if not vid: return None
-    except Exception:
-        return None
-    for inst in instances:
-        try:
-            url = f"{inst}/latest_version?id={vid}&itag=140"
-            resp = requests.get(url, timeout=20, stream=True)
-            if resp.status_code != 200: continue
-            path = os.path.join(out_dir, f"vn_{vid}.m4a")
-            with open(path, "wb") as f:
-                for chunk in resp.iter_content(64 * 1024):
-                    if chunk: f.write(chunk)
-            if os.path.getsize(path) > 10_000:
-                return path
-        except Exception:
-            continue
-    return None
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path,
+            "-vn", "-c:a", "libopus", "-b:a", "64k",
+            "-ar", "48000", "-ac", "1",
+            out_ogg,
+        ]
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
+        return r.returncode == 0 and os.path.isfile(out_ogg) and os.path.getsize(out_ogg) > 0
+    except Exception as e:
+        LOG.warning(f"ffmpeg extract failed: {e}")
+        return False
 
 
 @register_cmd("dl")
@@ -1213,32 +1306,81 @@ async def cmd_dl(event, arg):
             await safe_edit(event, f"👾 {str(e)[:120]}")
     asyncio.create_task(dl_task())
 
+
 @register_cmd("music")
 async def cmd_music(event, arg):
-    if not arg: return await safe_edit(event, "Use: .music <song>")
-    query = arg.strip()
-    await safe_edit(event, f"Searching: {query}")
+    """
+    .music <song>   → sends VIDEO + VOICE NOTE (both)
+    .music a <song> → audio only (voice note)
+    .music v <song> → video only
+    """
+    if not arg: return await safe_edit(event, "Use: .music [a|v] <song>")
+    arg = arg.strip()
+    mode = "both"
+    if arg.startswith("a "):
+        mode = "audio"; arg = arg[2:].strip()
+    elif arg.startswith("v "):
+        mode = "video"; arg = arg[2:].strip()
+    query = arg
+    if not query: return await safe_edit(event, "Use: .music [a|v] <song>")
+
+    await safe_edit(event, f"🎵 Searching: {query}")
     async def dl_task():
         try:
             loop = asyncio.get_event_loop()
             out_dir = str(TMP_DIR)
-            path = await loop.run_in_executor(None, _yt_dlp_try, query, out_dir)
-            if not path:
-                await safe_edit(event, "yt-dlp failed — trying invidious fallback...")
-                path = await loop.run_in_executor(None, _invidious_fallback, query, out_dir)
+            path, vid, info = await loop.run_in_executor(None, _yt_dlp_try, query, out_dir)
             if not path:
                 return await safe_edit(event,
                     "👾 Music failed on all methods.\n"
                     "▸ yt-dlp: blocked\n"
-                    "▸ invidious: no mirror reachable\n"
-                    "▸ Fix: add cookies.txt in DATA_DIR, ya direct URL bhej `.music <url>`")
-            clean = re.sub(r"[^\w\s-]", "", query).strip()[:40] or "audio"
-            await safe_edit(event, f"Sending: {clean}")
-            await bot.send_file(
-                event.chat_id, path,
-                voice_note=True,
-                caption=f"🎵 Music · {clean}\n👾 SHADOW",
-            )
+                    "▸ Fix: add cookies.txt in DATA_DIR")
+
+            raw_ttl = (info.get("title") if isinstance(info, dict) else None) or query
+            clean = re.sub(r"[^\w\s-]", "", raw_ttl).strip()[:60] or "audio"
+            dur = int((info.get("duration") if isinstance(info, dict) else 0) or 0)
+            uploader = (info.get("uploader") if isinstance(info, dict) else None) or BRAND
+
+            await safe_edit(event, f"🎵 Sending: {clean}")
+
+            # 1. VIDEO — send file
+            if mode in ("both", "video"):
+                try:
+                    await bot.send_file(
+                        event.chat_id, path,
+                        caption=f"🎬 {clean}\n👤 {uploader}\n⏱ {dur//60}:{dur%60:02d}\n✦ {BRAND} ✦",
+                        supports_streaming=True,
+                    )
+                    await asyncio.sleep(0.4)
+                except Exception as e:
+                    LOG.warning(f"video send failed: {e}")
+
+            # 2. VOICE NOTE — extract audio → ogg/opus
+            if mode in ("both", "audio"):
+                ogg = os.path.join(out_dir, f"vn_{vid or int(time.time())}.ogg")
+                ok = await loop.run_in_executor(None, _extract_voice_ogg, path, ogg)
+                if ok:
+                    try:
+                        with open(ogg, "rb") as fh:
+                            data = BytesIO(fh.read())
+                        data.name = f"{clean}.ogg"
+                        await bot.send_file(
+                            event.chat_id, data,
+                            voice_note=True,
+                            caption=f"🎵 {clean}\n👤 {uploader}\n✦ {BRAND} ✦",
+                            attributes=[DocumentAttributeAudio(
+                                duration=dur, title=clean, performer=uploader, voice=True,
+                            )],
+                        )
+                    except Exception as e:
+                        LOG.warning(f"voice send failed: {e}")
+                    finally:
+                        try: os.remove(ogg)
+                        except Exception: pass
+                else:
+                    if mode == "audio":
+                        await safe_edit(event, "👾 ffmpeg missing — voice note needs ffmpeg on PATH")
+
             try: os.remove(path)
             except Exception: pass
             await safe_delete(event)
@@ -1247,24 +1389,47 @@ async def cmd_music(event, arg):
             await safe_edit(event, f"Music error: {str(e)[:100]}")
     asyncio.create_task(dl_task())
 
+
+@register_cmd("voicegirl")
+async def cmd_voicegirl(event, arg):
+    if not arg:
+        return await safe_edit(event, "Use: .voicegirl <text>  or  .voicegirl <voice> | <text>")
+    if not _EDGE_OK:
+        return await safe_edit(event, "👾 edge-tts missing. Run: pip install edge-tts")
+    voice = GIRL_VOICES[0]; text = arg
+    if "|" in arg:
+        head, rest = arg.split("|", 1)
+        head = head.strip()
+        if head: voice = head; text = rest.strip()
+    if not text: return await safe_edit(event, "text required")
+    await safe_edit(event, f"👾 girl voice [{voice}]...")
+    await _tts_send(event, text[:3000], voice)
+
+
+@register_cmd("voiceboy")
+async def cmd_voiceboy(event, arg):
+    if not arg:
+        return await safe_edit(event, "Use: .voiceboy <text>  or  .voiceboy <voice> | <text>")
+    if not _EDGE_OK:
+        return await safe_edit(event, "👾 edge-tts missing. Run: pip install edge-tts")
+    voice = BOY_VOICES[0]; text = arg
+    if "|" in arg:
+        head, rest = arg.split("|", 1)
+        head = head.strip()
+        if head: voice = head; text = rest.strip()
+    if not text: return await safe_edit(event, "text required")
+    await safe_edit(event, f"👾 boy voice [{voice}]...")
+    await _tts_send(event, text[:3000], voice)
+
+
 @register_cmd("voice")
 async def cmd_voice(event, arg):
     if not arg: return await safe_edit(event, "Use: .voice <text>")
-    await safe_edit(event, "Generating...")
-    fname = os.path.join(str(TMP_DIR), f"voice_{int(time.time())}.mp3")
-    try:
-        gTTS(text=arg[:5000], lang="hi", slow=False).save(fname)
-    except Exception as e:
-        return await safe_edit(event, f"Voice failed: {str(e)[:60]}")
-    try:
-        if event.out:
-            await safe_delete(event)
-            await bot.send_file(event.chat_id, fname, caption=f"👾 {BRAND} 👾")
-        else:
-            await event.reply(file=fname, message=f"👾 {BRAND} 👾")
-    finally:
-        try: os.remove(fname)
-        except Exception: pass
+    if not _EDGE_OK:
+        return await safe_edit(event, "👾 edge-tts missing. Run: pip install edge-tts")
+    await safe_edit(event, "👾 voice...")
+    await _tts_send(event, arg[:3000], GIRL_VOICES[0])
+
 
 @register_cmd("weather")
 async def cmd_weather(event, arg):
@@ -1417,7 +1582,8 @@ async def cmd_status(event, _):
            f"▸ muted  : {local_muted} local / {len(global_muted)} global\n"
            f"▸ raids  : {len(raid_tasks)}\n▸ sprays : {len(spray_tasks)}\n"
            f"▸ swipes : {len(swipe_tasks)}\n▸ mode   : operational\n"
-           f"▸ clear  : {'ON' if ST.data.get('auto_clear_titles') else 'OFF'}")
+           f"▸ clear  : {'ON' if ST.data.get('auto_clear_titles') else 'OFF'}\n"
+           f"▸ mutegc : {len(muted_gcs)} GCs")
     await safe_edit(event, txt)
 
 @register_cmd("stats")
@@ -1445,6 +1611,8 @@ async def cmd_health(event, _):
         results.append(f"▸ yt-dlp   : {_y.version.__version__}")
     except Exception:
         results.append("▸ yt-dlp   : FAIL")
+    results.append(f"▸ edge-tts : {'yes' if _EDGE_OK else 'NO (pip install edge-tts)'}")
+    results.append(f"▸ ffmpeg   : {'yes' if _ffmpeg_ok() else 'NO (music voice-note needs it)'}")
     ck = DATA_DIR / "cookies.txt"
     results.append(f"▸ cookies  : {'yes' if ck.exists() else 'no'}")
     results.append(f"▸ data dir : {DATA_DIR}")
@@ -1476,12 +1644,13 @@ async def cmd_restore(event, _):
             data = json.loads(z.read("shadow_state.json").decode("utf-8"))
         ST.data = {**_DEFAULT_STATE, **data}
         ST.save()
-        global admins, global_muted, group_locks, muted_users
+        global admins, global_muted, group_locks, muted_users, muted_gcs
         global reply_users, rr_users, flag_users, replyshadow_users
         global menu_banner_msg, auto_react_emoji
         admins = set(int(x) for x in ST.data.get("admins", []))
         global_muted = set(int(x) for x in ST.data.get("gmutes", []))
         group_locks  = set(int(x) for x in ST.data.get("locks", []))
+        muted_gcs    = set(int(x) for x in ST.data.get("muted_gcs", []))
         muted_users  = {int(k): set(int(u) for u in v)
                         for k, v in ST.data.get("mutes", {}).items()}
         reply_users       = set(int(x) for x in ST.data.get("reply_targets", []))
@@ -1497,12 +1666,13 @@ async def cmd_restore(event, _):
 @register_cmd("reload")
 async def cmd_reload(event, _):
     ST.load()
-    global admins, global_muted, group_locks, muted_users
+    global admins, global_muted, group_locks, muted_users, muted_gcs
     global reply_users, rr_users, flag_users, replyshadow_users
     global menu_banner_msg, auto_react_emoji
     admins = set(int(x) for x in ST.data.get("admins", []))
     global_muted = set(int(x) for x in ST.data.get("gmutes", []))
     group_locks  = set(int(x) for x in ST.data.get("locks", []))
+    muted_gcs    = set(int(x) for x in ST.data.get("muted_gcs", []))
     muted_users  = {int(k): set(int(u) for u in v)
                     for k, v in ST.data.get("mutes", {}).items()}
     reply_users       = set(int(x) for x in ST.data.get("reply_targets", []))
@@ -1570,6 +1740,7 @@ async def cmd_stopall(event, _):
     if group_locks:       group_locks.clear();       stopped.append("locks")
     if muted_users:       muted_users.clear();       stopped.append("mutes")
     if global_muted:      global_muted.clear();      stopped.append("gmutes")
+    if muted_gcs:         muted_gcs.clear();         stopped.append("mutegc")
     if FASTGC_STATE.get("active"):
         FASTGC_STATE["active"] = False
         FASTGC_STATE["template"] = None
@@ -1602,6 +1773,36 @@ async def cmd_clear(event, arg):
         f"▸ mode : instant delete via raw update hook\n"
         f"▸ stats: {_nuke_stats['hits']} hits · {_nuke_stats['deleted']} deleted · "
         f"{_nuke_stats['calls']} calls")
+
+@register_cmd("heart")
+async def cmd_heart(event, arg):
+    import random as _r
+    name = (arg or "").strip()
+    hearts = ["❤️","🧡","💛","💚","💙","💜","🖤","🤍","🤎","🩷","🩵","🩶","💖","💘","💝","💗"]
+    shape = [
+        "  HH     HH  ",
+        " HHHH   HHHH ",
+        "HHHHHHHHHHHHH",
+    ]
+    bottom = [
+        "HHHHHHHHHHHHH",
+        " HHHHHHHHHHH ",
+        "  HHHHHHHHH  ",
+        "   HHHHHHH   ",
+        "    HHHHH    ",
+        "     HHH     ",
+        "      H      ",
+    ]
+    def paint(r): return "".join(_r.choice(hearts) if c == "H" else " " for c in r)
+    out = [paint(r) for r in shape]
+    if name:
+        out.append(f"{paint('HHHH')} {name[:14]} {paint('HHHH')}")
+    else:
+        out.append(paint("HHHHHHHHHHHHH"))
+    out += [paint(r) for r in bottom]
+    txt = "\n".join(out)
+    if event.out: await safe_edit(event, txt)
+    else: await event.reply(txt)
 
 @register_cmd("flip")
 async def cmd_flip(event, _):
@@ -1639,7 +1840,7 @@ async def cmd_info(event, arg):
         await safe_edit(event, f"Error: {str(e)[:60]}")
 
 
-# ---------- nuke system — direct fire ----------
+# ---------- nuke system ----------
 _nuke_stats = {"hits": 0, "deleted": 0, "calls": 0, "fails": 0}
 
 _SERVICE_ACTIONS = (
@@ -1720,6 +1921,24 @@ if bot is not None:
         if len(edit_cache[chat_id]) > EDIT_LIMIT:
             edit_cache[chat_id] = edit_cache[chat_id][-EDIT_LIMIT:]
         snipe_msgs[chat_id][event.id]["text"] = event.raw_text
+
+    @bot.on(events.NewMessage)
+    async def on_mutegc_handler(event):
+        """Delete every non-owner message in muted GCs."""
+        if event.out: return
+        chat = event.chat_id
+        if chat not in muted_gcs: return
+        sender = event.sender_id
+        if not sender: return
+        if sender == OWNER_ID: return
+        if is_admin(sender): return
+        try:
+            await event.delete()
+        except FloodWaitError as fw:
+            await asyncio.sleep(min(fw.seconds, 2.0))
+            try: await event.delete()
+            except Exception: pass
+        except Exception: pass
 
     @bot.on(events.NewMessage)
     async def on_auto_handler(event):
@@ -1840,6 +2059,8 @@ async def userbot_main():
         print(f"  user id   : {me.id}")
         print(f"  session   : {SESSION}.session")
         print(f"  data dir  : {DATA_DIR}")
+        print(f"  edge-tts  : {'on' if _EDGE_OK else 'OFF — pip install edge-tts'}")
+        print(f"  ffmpeg    : {'on' if _ffmpeg_ok() else 'OFF — install ffmpeg for voice notes'}")
         print("=" * 52)
         LOG.info(f"userbot online · {len(commands)} commands")
         try:
@@ -2105,8 +2326,7 @@ async def got_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot, chat_id,
         "Code sent to your Telegram app.\n\n"
         "Step 4/4 — Enter the 5-digit code, ONE DIGIT AT A TIME.\n"
-        "Example: send `1`, then `2`, then `3`, then `4`, then `5`.\n"
-        "The bot joins them into 12345 on its own.\n\n"
+        "Example: send `1`, then `2`, then `3`, then `4`, then `5`.\n\n"
         "digit 1/5 :",
     )
     return ASK_CODE
@@ -2250,8 +2470,9 @@ async def _finalize(update, context, chat_id: int):
         "Your userbot is now running 24/7.\n"
         "All commands are live — try `.menu` in any chat.\n\n"
         "`.clear on` → nuke every GC title/photo change msg.\n"
-        "`.clear stats` → live nuke counters.\n"
-        "`.music <song>` → 4 yt-dlp strategies + invidious fallback.\n\n"
+        "`.mutegc on` → mute an entire GC (auto-deletes non-owner msgs).\n"
+        "`.music <song>` → video + voice note both.\n"
+        "`.voicegirl` / `.voiceboy` → girl/boy TTS voice notes.\n\n"
         "Press the button below to log out completely at any time.",
         reply_markup=kb,
     )
