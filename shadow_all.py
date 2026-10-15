@@ -2,20 +2,16 @@
 # language: Python 3.10+
 # file: shadow_all.py
 # target: Windows cmd / Linux / Termux / Railway (Docker)
-# deps: pip install "python-telegram-bot>=21" telethon yt-dlp yt-dlp-ejs bgutil-ytdlp-pot-provider gTTS requests
-#       ffmpeg required on PATH (music → ogg/opus transcode)
-#       deno OR node required on PATH (yt-dlp JS challenge solver)
+# deps: pip install "python-telegram-bot>=21" telethon yt-dlp gTTS requests
+#       ffmpeg optional (voice-note transcode)
 #
-# MODE A:  python shadow_all.py            → onboarding bot
-# MODE B:  python shadow_all.py --userbot  → userbot
+# MODE A (default):  python shadow_all.py
+#   -> onboarding bot, admin-approval gate, collects API creds, spawns MODE B
+# MODE B:  python shadow_all.py --userbot <chat_id>
+#   -> the userbot — all .commands, .clear nuke system, etc.
 #
-# v3.5:
-#   • reply texts sourced from vaani pack — every emoji collapsed to single 👾
-#   • .hrr / .shr  → heart raid (new)
-#   • .replygod    → 3x burst alias of .replyshadow
-#   • .clear rewritten — event.action based, deletes ANY service msg in GC
-#   • MENU: CLEAR section removed, .clear folded into TOOLS
-#   • YouTube 2026 fix — tv/web/android_vr/ios client order, deno JS, POT plugin
+# Railway: set SHADOW_DATA_DIR=/data + attach a volume at /data
+#          set SHADOW_BOT_TOKEN=<your-token> (optional)
 
 import asyncio
 import atexit
@@ -26,31 +22,33 @@ import logging
 import os
 import random
 import re
-import shutil
 import signal
 import subprocess
 import sys
 import time
 import traceback
+from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, Optional, Set
 
 # ------------------------------------------------------------------
-#  paths
+#  paths  — Railway-ready (SHADOW_DATA_DIR → persistent volume)
 # ------------------------------------------------------------------
 BASE_DIR  = Path(__file__).resolve().parent
 DATA_DIR  = Path(os.environ.get("SHADOW_DATA_DIR", str(BASE_DIR)))
 USERS_DIR = DATA_DIR / "users"
 SESS_DIR  = DATA_DIR / "sessions"
 RUN_DIR   = DATA_DIR / "run"
-DL_DIR    = BASE_DIR / "downloads"
-TMP_DIR   = BASE_DIR / "temp"
+DL_DIR    = DATA_DIR / "downloads"
+TMP_DIR   = DATA_DIR / "temp"
 for d in (DATA_DIR, USERS_DIR, SESS_DIR, RUN_DIR, DL_DIR, TMP_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-BOT_TOKEN = os.environ.get("SHADOW_BOT_TOKEN",
-                           "8855726336:AAFgXfhKTssjc9QSRwa0dhoBOWToqF_OjDo")
+BOT_TOKEN = os.environ.get(
+    "SHADOW_BOT_TOKEN",
+    "8855726336:AAFgXfhKTssjc9QSRwa0dhoBOWToqF_OjDo",
+)
 
 # ------------------------------------------------------------------
 #  logging
@@ -100,21 +98,20 @@ try:
     from telethon.tl.types import ChatAdminRights, ReactionEmoji
 except Exception as e:
     print(f"missing dep: {e}")
-    print("pip install \"python-telegram-bot>=21\" telethon yt-dlp yt-dlp-ejs "
-          "bgutil-ytdlp-pot-provider gTTS requests")
+    print('pip install "python-telegram-bot>=21" telethon yt-dlp gTTS requests')
     sys.exit(1)
 
 
 # ==================================================================
-#  SECTION 1 — USERBOT
+#  SECTION 1 — USERBOT  (env-driven)
 # ==================================================================
 
 API_ID    = int(os.environ.get("SHADOW_API_ID",   "0"))
 API_HASH  = os.environ.get("SHADOW_API_HASH",     "")
 OWNER_ID  = int(os.environ.get("SHADOW_OWNER_ID", "0"))
 PHONE     = os.environ.get("SHADOW_PHONE",        "")
-SESSION    = os.environ.get("SHADOW_SESSION", str(DATA_DIR / "shadoww"))
-STATE_FILE = os.environ.get("SHADOW_STATE",   str(DATA_DIR / "shadow_state.json"))
+SESSION   = os.environ.get("SHADOW_SESSION",      str(DATA_DIR / "shadoww"))
+STATE_FILE = os.environ.get("SHADOW_STATE",       str(DATA_DIR / "shadow_state.json"))
 
 BRAND = "𝐒 𝐇 𝐀 𝐃 𝐎 𝐖 𝐖"
 
@@ -138,10 +135,8 @@ _DEFAULT_STATE = {
     "rr_targets":     [],
     "flag_targets":   [],
     "shadow_targets": [],
-    "hrr_targets":    [],
     "auto_react":   None,
-    "auto_clear_titles":   False,
-    "auto_clear_bot_msgs": False,
+    "auto_clear_titles": False,
     "config": {
         "spray_delay": 0.25,
         "raid_delay":  0.25,
@@ -194,18 +189,8 @@ reply_users: Set[int]      = set(int(x) for x in ST.data.get("reply_targets", []
 rr_users: Set[int]         = set(int(x) for x in ST.data.get("rr_targets", []))
 flag_users: Set[int]       = set(int(x) for x in ST.data.get("flag_targets", []))
 replyshadow_users: Set[int]= set(int(x) for x in ST.data.get("shadow_targets", []))
-hrr_users: Set[int]        = set(int(x) for x in ST.data.get("hrr_targets", []))
 menu_banner_msg: Optional[tuple] = tuple(ST.data["banner"]) if ST.data.get("banner") else None
 auto_react_emoji: Optional[str]  = ST.data.get("auto_react")
-
-OUR_BOT_USERNAMES: Set[str] = set(ADD_BOTS_LIST)
-_our_bot_ids_cache: Set[int] = set()
-_our_bot_cache_loaded = False
-_my_userbot_id: Optional[int] = None
-
-_nuke_queue: "asyncio.Queue" = asyncio.Queue()
-_NUKE_BATCH_MAX   = 100
-_NUKE_BATCH_WAIT  = 0.03
 
 
 def persist():
@@ -217,12 +202,12 @@ def persist():
     ST.data["rr_targets"]     = sorted(rr_users)
     ST.data["flag_targets"]   = sorted(flag_users)
     ST.data["shadow_targets"] = sorted(replyshadow_users)
-    ST.data["hrr_targets"]    = sorted(hrr_users)
     ST.data["auto_react"]     = auto_react_emoji
     ST.data["banner"]         = list(menu_banner_msg) if menu_banner_msg else None
     ST.save()
 
 
+# ---------- client (only used in userbot mode) ----------
 if API_ID and API_HASH:
     bot = TelegramClient(
         SESSION, API_ID, API_HASH,
@@ -247,190 +232,77 @@ FASTGC_STATE  = {"active": False, "template": None, "task": None, "chat_id": Non
 _cooldowns: Dict[tuple, float] = {}
 
 
-# ==================================================================
-#  TAUNT PACKS — vaani sources, every line ends with single 👾
-# ==================================================================
-
 RAID_MESSAGES = [
-    "𝐊ʸᴀ 𝐑ᴇ 𝐓ᴇʀɪ 𝐂ᴏᴏʟ 𝐁ᴀᴛᴇ𝐇 ᴛᴜ 𝐂ʜᴏᴅ 𝐀ᴘɴɪ 𝐁ᴇᴇɴ ᴛᴇxxᴛ 𝐒ᴇ 👾",
-    "𝐉ɪ 𝐌ᴏᴏ 𝐌ᴏᴏᴋ 𝐆ᴏʟɪ 𝐘ᴏᴏᴋ - 𝐉ᴇ 𝐓ᴇxxᴛ 👾",
-    "acha beta ? coi na me toh HATER codunga 👾",
-    "chudke bhaga kaise 👾",
-    "ne toh 𝐓ᴇxxᴛ ka lun muh me lelia 👾",
-    "try maa सूर्य nikalte hi pel du 👾",
-    "mkl lun te vaj 👾",
-    "𝑻ᴏʟᴇ pe 𝐓ᴇxxᴛ ka hamla 👾",
-    "oi 𝐓ᴇʀɪ 𝐌‐ᴏᴏ गुलाम 👾",
-    "chl rndyce chud ke dikha 👾",
-    "𝐉ɪ 𝐌ᴏᴏ 𝐌ᴏᴏᴋ 𝐆ᴏʟɪ naacho 👾",
-    "tera baap bass 𝐓ᴇxxᴛ hai 👾",
-    "try maa hagte hue paad mari 👾",
-    "𝐓ᴇʀɪ 𝐌‐ᴏᴏᴋ 𝐂ʜᴏᴅ 𝐃ɪ 𝐓ᴇxxᴛ 𝐍ᴇ 𝐁ʜᴇᴇᴄʜᴇ 𝐁ʜᴇᴇᴄʜᴇ 👾",
-    "𝐂ʜʜ 𝐍ᴇᴋᴏᴜᴛᴇ 𝐉ᴇ लड़के 👾",
+    "👾 ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴀᴀɢ ʟᴀɢᴀ ᴅᴜɴɢᴀ 👾",
+    "👾 ʜᴀʀ ᴍᴇꜱꜱᴀɢᴇ ᴘᴇ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ʏᴀᴀᴅ ᴅɪʟᴀᴛᴀ ʜᴜ 👾",
+    "👾 ᴛᴇʀᴇ ʙᴀᴀᴘ ᴋᴀ ɴᴀᴀᴍ ʟᴇᴋᴇ ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴄʜᴏᴅ ᴅᴜɴɢᴀ 👾",
+    "👾 ᴋʏᴀ ʀᴇ ᴄʜᴏᴅᴜ ᴛʏᴘɪɴɢ ʀᴏᴋ ɢᴀʏɪ ᴋʏᴀ ᴛᴇʀɪ 👾",
+    "👾 ɴᴀꜱᴀ ꜱᴇ ɴᴇᴡꜱ ᴀᴀʏɪ ᴛᴇʀɪ ᴍᴀᴀ ɢᴀʟɪ ɢᴀʟɪ ᴄʜᴜᴅ ʀᴀʜɪ ʜᴀɪ 👾",
+    "👾 ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴘɪᴄ ᴅᴇᴋʜɪ ᴏʀ ʟᴜɴᴅ ᴋʜᴀᴅᴀ ʜᴏ ɢᴀʏᴀ 👾",
+    "👾 ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴍᴇɴᴇ ʀᴀɴᴅɪ ʙᴀɴᴀ ᴋᴇ ᴛᴇʀᴇ ᴄʜᴀᴄʜᴀ ᴋᴇ ꜱᴀᴛʜ ʙᴇᴄʜ ᴅɪʏᴀ 👾",
+    "👾 ʙʜᴏꜱᴅɪᴋᴇ ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ʙʜᴏꜱᴅᴀ ᴍᴇʀᴀ ʜᴀɪ ᴊᴀʙ ᴄʜᴀʜᴇ ᴄʜᴏᴅ ᴅᴜɴɢᴀ 👾",
+    "👾 ᴋʏᴀ ʀᴇ ᴍᴀᴅᴀʀᴄʜᴏᴅ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴇ ᴍᴇʀᴀ ʟᴜɴᴅ ɢʜᴜꜱᴀ ᴅᴜɴɢᴀ 👾",
+    "👾 ᴛᴇʀᴇ ᴋʜᴀɴᴅᴀɴ ᴋɪ ʟᴀꜱʜ ᴋᴏ ɢᴀʟɪ ɢᴀʟɪ ɢʜᴜᴍᴀᴜɴɢᴀ 👾",
+    "👾 ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴍᴇʀᴀ ʙᴇᴛᴀ ʜᴀɪ ᴊᴀɴᴛᴀ ʜᴀɪ ᴋʏᴀ 👾",
+    "👾 ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ ᴀᴋᴀʟ ᴀᴀᴛɪ ᴛᴏ ʙᴏʟ ᴡʀɴᴀ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀᴀʀ ᴅᴜɴɢᴀ 👾",
 ]
 
 SWIPE_MESSAGES = [
-    "chudke bhaga kaise 👾",
-    "ne toh 𝐓ᴇxxᴛ ka lun muh me lelia 👾",
-    "try maa सूर्य nikalte hi pel du 👾",
-    "mkl lun te vaj 👾",
-    "𝑻ᴏʟᴇ pe 𝐓ᴇxxᴛ ka hamla 👾",
-    "𝐂ʜʜ 𝐍ᴇᴋᴏᴜᴛᴇ 𝐉ᴇ लड़के 👾",
-    "oi 𝐓ᴇʀɪ 𝐌‐ᴏᴏ गुलाम 👾",
-    "chl rndyce chud ke dikha 👾",
-    "𝐉ɪ 𝐌ᴏᴏ 𝐌ᴏᴏᴋ 𝐆ᴏʟɪ naacho 👾",
-    "tera baap bass 𝐓ᴇxxᴛ hai 👾",
-    "try maa hagte hue paad mari 👾",
+    "👾 ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴄʜᴏᴅ ᴋᴇ ᴋᴏᴛʜɪ ᴍᴇ ꜰᴇᴋ ᴀᴀᴜɴɢᴀ 👾",
+    "👾 ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ꜱᴜᴘᴇʀᴄᴀʀ ɢʜᴜꜱᴀ ᴅᴜɴɢᴀ 👾",
+    "👾 ᴋʏᴀ ʀᴇ ʀᴀɴᴅɪ ᴋᴇ ʀᴇᴘʟʏ ɴᴀʜɪ ᴋᴀʀᴛᴀ 👾",
+    "👾 ᴛᴇʀᴀ ʙᴀᴀᴘ ʜᴜ ᴍᴀɪ ᴄʜᴜᴘ ᴋᴀʀ ʀᴀɴᴅɪᴋᴇ 👾",
+    "👾 ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ʙʜᴏꜱᴅᴀ ᴛᴇʀᴇ ʜᴀᴡᴀʟᴇ ᴋᴀʀ ᴅᴜɴɢᴀ 👾",
+    "👾 ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴀᴀɢ ʟᴀɢᴀ ᴋᴇ ʀᴀᴀᴋʜ ᴋᴀʀ ᴅᴜɴɢᴀ 👾",
+    "👾 ᴇᴋ ᴍᴇꜱꜱᴀɢᴇ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ʟᴀꜱʜ ɢᴀʟɪ ᴍᴇ ᴘᴀᴅɪ ʜᴏɢɪ 👾",
+    "👾 ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴍᴇɴᴇ ʀᴀɴᴅɪ ʙᴀɴᴀ ᴅɪʏᴀ 👾",
+    "👾 ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʟᴜɴᴅ ᴅᴀᴀʟ ᴅᴜɴɢᴀ 👾",
+    "👾 ᴛᴇʀᴀ ᴋʜᴀɴᴅᴀɴ ᴋʜᴀᴛᴍ ᴛᴇʀɪ ᴍᴀᴀ ꜱᴇ ꜱʜᴜʀᴜ ʜᴏᴛᴀ ʜᴀɪ 👾",
 ]
-
 reply_list = [
-    "𝐊ʸᴀ 𝐑ᴇ 𝐓ᴇʀɪ 𝐂ᴏᴏʟ 𝐁ᴀᴛᴇ𝐇 ᴛᴜ 𝐂ʜᴏᴅ 𝐀ᴘɴɪ 𝐁ᴇᴇɴ ᴛᴇxxᴛ 𝐒ᴇ 👾",
-    "𝐉ɪ 𝐌ᴏᴏ 𝐌ᴏᴏᴋ 𝐆ᴏʟɪ 𝐘ᴏᴏᴋ - 𝐉ᴇ 𝐓ᴇxxᴛ 👾",
-    "acha beta ? coi na me toh HATER codunga 👾",
-    "chudke bhaga kaise 👾",
-    "ne toh 𝐓ᴇxxᴛ ka lun muh me lelia 👾",
-    "try maa सूर्य nikalte hi pel du 👾",
-    "mkl lun te vaj 👾",
-    "𝑻ᴏʟᴇ pe 𝐓ᴇxxᴛ ka hamla 👾",
-    "𝐂ʜʜ 𝐍ᴇᴋᴏᴜᴛᴇ 𝐉ᴇ लड़के 👾",
-    "oi 𝐓ᴇʀɪ 𝐌‐ᴏᴏ गुलाम 👾",
-    "chl rndyce chud ke dikha 👾",
-    "𝐉ɪ 𝐌ᴏᴏ 𝐌ᴏᴏᴋ 𝐆ᴏʟɪ naacho 👾",
-    "tera baap bass 𝐓ᴇxxᴛ hai 👾",
-    "try maa hagte hue paad mari 👾",
-    "𝐓ᴇʀɪ 𝐌‐ᴏᴏᴋ 𝐂ʜᴏᴅ 𝐃ɪ 𝐓ᴇxxᴛ 𝐍ᴇ 𝐁ʜᴇᴇᴄʜᴇ 𝐁ʜᴇᴇᴄʜᴇ 👾",
+    "ᴄʜᴜᴘ ᴋᴀʀ ʀᴀɴᴅɪ ᴋᴇ 👾", "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴀᴀɢ 👾",
+    "ᴋʏᴀ ʀᴇ ᴄʜᴏᴅᴜ ʀᴇᴘʟʏ ᴅᴇ 👾", "ᴛᴇʀɪ ʙᴇʜᴇɴ ʀᴀɴᴅɪ ʜᴀɪ 👾",
+    "ᴛᴇʀᴀ ʙᴀᴀᴘ ʜᴜ ᴍᴀɪ 👾", "ɢᴀᴀɴᴅ ᴍᴀʀᴀ ᴀᴘɴɪ ᴍᴀᴅᴀʀᴄʜᴏᴅ 👾",
+    "ꜱʜᴀᴋᴀʟ ᴅᴇᴋʜ ᴀᴘɴɪ 👾", "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ʙʜᴇᴊ ᴍᴇʀᴇ ᴘᴀᴀꜱ 👾",
+    "ᴄʜᴜᴅ ᴊᴀ ᴄʜᴜᴘᴄʜᴀᴘ 👾", "ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴇ ʟᴜɴᴅ 👾",
+    "ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ 👾", "ᴛᴇʀɪ ᴍᴀᴀ ᴄʜᴜᴅ ʀᴀʜɪ ʜᴀɪ 👾",
+    "ᴋʏᴀ ʀᴇ ɢᴀɴᴅᴜ 👾", "ᴛᴇʀᴀ ᴋʜᴀɴᴅᴀɴ ʀᴀɴᴅɪ ᴋʜᴀɴᴀ 👾",
+    "ᴀᴀ ᴊᴀ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀᴀʀᴜ 👾",
 ]
-
 reply_texts = [
-    "𝐂ʸбᴌ 𝐓ᴇ मदरचोद 𝐓ᴇxxᴛ बाप के सामने 𝐅ʸʟᴇК 𝐁ᴇЙч 👾",
-    "नहीं नहीं तेरी मां को 𝐓ʀᴇᴛ𝐬 𝐓ᴇxxᴛ बाप चोद सकता है ४४४४४ sᴇ ʀᴇᴀᴅʏ ??? 👾",
-    "तेरी मां का 𝐓ʀᴇᴛ𝐬 भोसड़ा 👾",
-    "𝐓ʏᴘᴇ sᴏᴏɴ ʀᴇᴀᴅʏ 𝐓ᴇʀᴀ 𝐃ᴀᴅᴅʏ 𝐊ᴀ 𝐁ᴀᴀᴘ 𝐌ᴇʀᴀ 𝐆ᴜʟᴀᴍ 👾",
-    "सोच तेरी बहन को 𝐓ᴇxxᴛ बाप का गुलाम चोद रहा 👾",
-    "Hello hello?? Oxygen aarahi है? रण्डी पुत्र 👾",
-    "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन 𝐓ᴇxxᴛ /\\~ बाप से सही chudi 👾",
-    "ʜᴍ ʜᴇʀᴇ ʜᴇʀᴇ ʙʟᴏᴏᴅʏ ᴛᴇxxᴛ ᴋᴇ ʙᴀᴀᴘ ᴋᴇ ʜᴀʀᴇᴍ sᴇ ᴋᴏɪ ᴛᴏ ʜᴇʀᴇ ʀᴀɴᴅɪ ᴛᴇʀɪ मां घर घर जाके MOAN करती है ! 👾",
-    "मां चूदा अपनी यहा से 👾",
-    "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 👾",
-    "𝐓ᴇʀᴋ 𝐁ʜᴇ𝐍 𝐉ᴇ ʸᴏᴏᴍᴍʏ 👾",
-    "₹☼ ₹𝐉ɪбᴇ 𝐍ᴇʟ 𝐆ᴏʟᴋ 𝐓ᴇʀᴋ 𝐌ᴏᴏ 𝐉ᴏ 𝐂ʜᴏᴅЙᴇ मेरी रेलगाड़ी आ रही 👾",
-    "𝐓ᴇʀᴋ 𝐌ᴏ 𝐉ᴏ 𝐂ʜɪК𝐍 𝐏ᴏᴙ 𝐓ᴇ𝐖ᴇЙ 𝐍ᴏ 𝐀𝐊 𝐓ᴏ 𝐒ɪᴙᴇ 𝐕ɪКᴇ 𝐍ᴏЙᴇ 𝐘ᴇ 👾",
-]
-
-fun_texts = [
-    "𝐊ʸᴀ 𝐑ᴇ 𝐓ᴇʀɪ 𝐂ᴏᴏʟ 𝐁ᴀᴛᴇ𝐇 ᴛᴜ 𝐂ʜᴏᴅ 𝐀ᴘɴɪ 𝐁ᴇᴇɴ 𝐓ᴇxxᴛ 𝐒ᴇ 👾",
-    "𝐉ɪ 𝐌ᴏᴏ 𝐌ᴏᴏᴋ 𝐆ᴏʟɪ 𝐘ᴏᴏᴋ - 𝐉ᴇ 𝐓ᴇxxᴛ ! 👾",
-    "acha beta ? coi na me toh HATER codunga 👾",
-    "chudke bhaga kaise 👾",
-    "ne toh 𝐓ᴇxxᴛ ka lun muh me lelia 👾",
-    "try maa सूर्य nikalte hi pel du 👾",
-    "mkl lun te vaj 👾",
-    "𝑻ᴏʟᴇ pe 𝐓ᴇxxᴛ ka hamla 👾",
-    "oi 𝐓ᴇʀɪ 𝐌‐ᴏᴏ गुलाम 👾",
-    "chl rndyce chud ke dikha 👾",
-    "𝐉ɪ 𝐌ᴏᴏ 𝐌ᴏᴏᴋ 𝐆ᴏʟɪ naacho 👾",
-    "tera baap bass 𝐓ᴇxxᴛ hai 👾",
-    "𝐓ᴇʀɪ 𝐌‐ᴏᴏᴋ 𝐂ʜᴏᴅ 𝐃ɪ 𝐓ᴇxxᴛ 𝐍ᴇ 𝐁ʜᴇᴇᴄʜᴇ 𝐁ʜᴇᴇᴄʜᴇ 👾",
-]
-
-flag_texts = [
-    "𝐊ʸᴀ 𝐑ᴇ 𝐓ᴇʀɪ 𝐂ᴏᴏʟ 𝐁ᴀᴛᴇ𝐇 ᴛᴜ 𝐂ʜᴏᴅ 𝐀ᴘɴɪ 𝐁ᴇᴇɴ 𝐓ᴇxxᴛ 𝐒ᴇ 👾",
-    "𝐉ɪ 𝐌ᴏᴏ 𝐌ᴏᴏᴋ 𝐆ᴏʟɪ 𝐘ᴏᴏᴋ - 𝐉ᴇ 𝐓ᴇxxᴛ 👾",
-    "acha beta ? coi na me toh HATER codunga 👾",
-    "chudke bhaga kaise 👾",
-    "ne toh 𝐓ᴇxxᴛ ka lun muh me lelia 👾",
-    "try maa सूर्य nikalte hi pel du 👾",
-    "mkl lun te vaj 👾",
-    "𝑻ᴏʟᴇ pe 𝐓ᴇxxᴛ ka hamla 👾",
-    "𝐂ʜʜ 𝐍ᴇᴋᴏᴜᴛᴇ 𝐉ᴇ लड़के 👾",
-    "oi 𝐓ᴇʀɪ 𝐌‐ᴏᴏ गुलाम 👾",
-    "chl rndyce chud ke dikha 👾",
-]
-
-heart_replies = [
-    "ᴋᴜᴄʜ ᴛᴏ ʙᴏʟ ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ʙʜᴏꜱᴅᴀ 👾",
-    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴘʏᴀʀ 👾",
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʟᴜɴᴅ ᴅᴀᴀʟ ᴅᴜɴɢᴀ 👾",
+    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ʀᴏᴢ ᴄʜᴏᴅᴛᴀ ʜᴜ ᴍᴀɪ 👾",
+    "ᴀᴘɴɪ ᴍᴀᴀ ᴋᴏ ʙᴏʟ ᴋᴇ ᴀᴀ 👾",
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴍᴇʀᴇ ᴘᴀᴀꜱ ʙʜᴇᴊ 👾",
+    "ᴄʜᴜᴘ ᴋᴀʀ ᴡʀɴᴀ ɢᴀᴀɴᴅ ᴍᴀʀ ᴅᴜɴɢᴀ 👾",
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ɢᴀᴀɴᴅ ᴄʜᴀᴛ ᴅᴜɴɢᴀ 👾",
+    "ʟᴜɴᴅ ᴘᴇ ʙᴀɪᴛʜ ᴊᴀ 👾",
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴅᴀɪ ᴅᴇᴋʜ ʟᴇ ᴀᴘɴɪ 👾",
+    "ɢᴀɴᴅᴜ ᴋᴀʜɪ ᴋᴀ 👾",
+    "ꜱʜᴀᴋᴀʟ ꜱᴇ ʜɪ ʀᴀɴᴅɪ ʟᴀɢᴛᴀ ʜᴀɪ 👾",
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ꜱᴀᴍʙʜᴀʟ ᴋᴇ ʀᴀᴋʜ 👾",
     "ᴍᴀᴀ ᴄʜᴜᴅᴀ ᴀᴘɴɪ ʏᴀʜᴀ ꜱᴇ 👾",
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ʀᴀɴᴅɪ ʙᴀɴᴀ ᴅɪʏᴀ 👾",
-    "ᴛᴇʀᴇ ʙᴀᴀᴘ ᴋᴀ ɴᴀᴀᴍ ʟᴇᴋᴇ ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴄʜᴏᴅ ᴅᴜɴɢᴀ 👾",
-    "ᴋʏᴀ ʀᴇ ʀᴀɴᴅɪ ᴋᴇ ʀᴇᴘʟʏ ɴᴀʜɪ ᴋᴀʀᴛᴀ 👾",
-    "ᴛᴇʀᴀ ʙᴀᴀᴘ ʜᴜ ᴍᴀɪ ᴄʜᴜᴘ ᴋᴀʀ ʀᴀɴᴅɪᴋᴇ 👾",
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴀᴀɢ ʟᴀɢᴀ ᴋᴇ ʀᴀᴀᴋʜ ᴋᴀʀ ᴅᴜɴɢᴀ 👾",
-    "ᴇᴋ ᴍᴇꜱꜱᴀɢᴇ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ʟᴀꜱʜ ɢᴀʟɪ ᴍᴇ ᴘᴀᴅɪ ʜᴏɢɪ 👾",
-    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʟᴜɴᴅ ᴅᴀᴀʟ ᴅᴜɴɢᴀ 👾",
-    "ᴛᴇʀᴀ ᴋʜᴀɴᴅᴀɴ ᴋʜᴀᴛᴍ ᴛᴇʀɪ ᴍᴀᴀ ꜱᴇ ꜱʜᴜʀᴜ ʜᴏᴛᴀ ʜᴀɪ 👾",
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴄʜᴏᴅ ᴋᴇ ᴋᴏᴛʜɪ ᴍᴇ ꜰᴇᴋ ᴀᴀᴜɴɢᴀ 👾",
-    "ᴋʏᴀ ʀᴇ ᴍᴀᴅᴀʀᴄʜᴏᴅ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴇ ᴍᴇʀᴀ ʟᴜɴᴅ ɢʜᴜꜱᴀ ᴅᴜɴɢᴀ 👾",
-    "ᴛᴇʀᴇ ᴋʜᴀɴᴅᴀɴ ᴋɪ ʟᴀꜱʜ ᴋᴏ ɢᴀʟɪ ɢᴀʟɪ ɢʜᴜᴍᴀᴜɴɢᴀ 👾",
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴍᴇʀᴀ ʙᴇᴛᴀ ʜᴀɪ ᴊᴀɴᴛᴀ ʜᴀɪ ᴋʏᴀ 👾",
-    "ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ ᴀᴋᴀʟ ᴀᴀᴛɪ ᴛᴏ ʙᴏʟ ᴡʀɴᴀ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀᴀʀ ᴅᴜɴɢᴀ 👾",
 ]
-
-
-# ---------- yt-dlp YouTube 2026 bypass ----------
-def _ydl_youtube_opts(base: dict) -> dict:
-    """YouTube 2026 anti-bot: EJS + POT + cookie-aware client order."""
-    opts = dict(base)
-
-    ea = opts.setdefault("extractor_args", {})
-    ea["youtube"] = {
-        "player_client": ["tv", "web", "android_vr", "ios"],
-        "player_skip":   ["webpage", "configs"],
-    }
-
-    opts.setdefault("force_ipv4",        True)
-    opts.setdefault("socket_timeout",    20)
-    opts.setdefault("extractor_retries", 3)
-    opts.setdefault("http_headers", {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/126.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-    })
-
-    for ck_dir in (DATA_DIR, BASE_DIR):
-        ck = ck_dir / "cookies.txt"
-        if ck.exists():
-            opts["cookiefile"] = str(ck)
-            break
-    for cf_dir in (DATA_DIR, BASE_DIR):
-        cf = cf_dir / "cookies_from_browser.txt"
-        if cf.exists():
-            try:
-                br = cf.read_text(encoding="utf-8").strip().lower()
-                if br in ("chrome", "edge", "firefox", "brave", "opera", "chromium"):
-                    opts["cookiesfrombrowser"] = (br,)
-            except Exception:
-                pass
-            break
-    return opts
-
-
-# ---------- ffmpeg helpers ----------
-def _ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
-
-
-def _mp3_to_ogg_opus(mp3_path: str) -> Optional[str]:
-    if not _ffmpeg_available():
-        return None
-    ogg_path = str(Path(mp3_path).with_suffix(".ogg"))
-    try:
-        r = subprocess.run(
-            ["ffmpeg", "-y", "-i", mp3_path,
-             "-c:a", "libopus", "-b:a", "64k",
-             "-ar", "48000", "-ac", "1",
-             ogg_path],
-            capture_output=True, timeout=90,
-        )
-        if r.returncode == 0 and os.path.exists(ogg_path) and os.path.getsize(ogg_path) > 0:
-            return ogg_path
-        LOG.warning(f"ffmpeg rc={r.returncode}: {r.stderr[-300:].decode(errors='ignore')}")
-    except Exception as e:
-        LOG.warning(f"ogg transcode failed: {e}")
-    return None
+fun_texts = [
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴇ ʙʜᴏꜱᴅᴇ ᴍᴇ ᴍᴇʀᴀ ʟᴜɴᴅ ꜰᴀꜱ ɢᴀʏᴀ 👾",
+    "ᴋʏᴀ ʀᴇ ᴄʜᴏᴅᴜ ʀᴇᴘʟʏ ɴᴀʜɪ ᴋᴀʀ ʀᴀʜᴀ 👾",
+    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ᴄʜᴏᴅ ᴄʜᴜᴋᴀ ʜᴜ ᴍᴀɪ 👾",
+    "ᴀᴘɴɪ ᴍᴀᴀ ᴋɪ ꜱʜᴀᴋᴀʟ ᴅᴇᴋʜ ʟᴇ 👾",
+    "ɢᴀᴀɴᴅ ᴍᴀʀᴀ ʟᴇ ᴀᴘɴɪ 👾",
+    "ᴋʏᴀ ʀᴇ ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ 👾",
+    "ᴄʜᴜᴅ ᴊᴀ ʙʜᴀɪ ᴄʜᴜᴘᴄʜᴀᴘ 👾",
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴀᴀɢ ʟᴀɢᴀ ᴅᴜɴɢᴀ 👾",
+]
+flag_texts = [
+    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʜᴀᴍʟᴀ ᴋᴀʀ ᴅᴜɴɢᴀ 👾",
+    "ᴀᴘɴɪ ᴍᴀᴀ ᴋᴏ ꜱᴀᴍʙʜᴀʟ ᴋᴇ ʀᴀᴋʜ 👾",
+    "ʙᴏʟ ᴋʏᴀ ᴘʀᴏʙʟᴇᴍ ʜᴀɪ 👾",
+    "ᴋʏᴀ ʀᴇ ɢᴀɴᴅᴜ 👾",
+    "ᴍᴀᴀ ᴄʜᴜᴅᴀ ᴀᴘɴɪ 👾",
+    "ᴄʜᴜᴅ ᴊᴀ ᴄʜᴜᴘᴄʜᴀᴘ 👾",
+    "ᴀᴀ ᴊᴀ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀᴀʀᴜ 👾",
+    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴀɪꜱɪ ʜᴀɪ 👾",
+]
 
 
 # ---------- helpers ----------
@@ -443,62 +315,6 @@ def is_admin(uid: Optional[int]) -> bool:
 def is_user_muted(chat_id: int, user_id: int) -> bool:
     if user_id in global_muted: return True
     return chat_id in muted_users and user_id in muted_users[chat_id]
-
-
-async def _ensure_our_bot_ids():
-    global _our_bot_cache_loaded, _my_userbot_id
-    if _our_bot_cache_loaded: return
-    if bot is None: return
-    try:
-        me = await bot.get_me()
-        if me and getattr(me, "id", None):
-            _my_userbot_id = int(me.id)
-            _our_bot_ids_cache.add(int(me.id))
-    except Exception:
-        pass
-    for uname in OUR_BOT_USERNAMES:
-        try:
-            ent = await resolve_bot(uname)
-            if ent and getattr(ent, "id", None):
-                _our_bot_ids_cache.add(int(ent.id))
-        except Exception:
-            pass
-    _our_bot_cache_loaded = True
-    LOG.info(f"my userbot id: {_my_userbot_id}")
-    LOG.info(f"our bot ids cached: {sorted(_our_bot_ids_cache)}")
-
-
-async def _nuke_worker():
-    while True:
-        try:
-            peer_id, msg_id = await _nuke_queue.get()
-            batch = [(peer_id, msg_id)]
-            deadline = time.monotonic() + _NUKE_BATCH_WAIT
-            while len(batch) < _NUKE_BATCH_MAX:
-                timeout = deadline - time.monotonic()
-                if timeout <= 0: break
-                try:
-                    p, m = await asyncio.wait_for(_nuke_queue.get(), timeout=timeout)
-                    batch.append((p, m))
-                except asyncio.TimeoutError:
-                    break
-            by_peer: Dict[int, list] = {}
-            for p, m in batch:
-                by_peer.setdefault(p, []).append(m)
-            for peer, ids in by_peer.items():
-                try:
-                    await bot.delete_messages(peer, ids)
-                except FloodWaitError as fw:
-                    await asyncio.sleep(min(fw.seconds, 1.0))
-                    try: await bot.delete_messages(peer, ids)
-                    except Exception: pass
-                except Exception:
-                    pass
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            pass
-
 
 async def safe_edit(event, text: str, **kw):
     if not text: return None
@@ -615,21 +431,21 @@ async def run_with_flood_retry(coro_factory, event, cmd_name: str):
         await safe_edit(event, f"👾 {type(e).__name__}: {str(e)[:100]}")
 
 
-# ------------------------------------------------------------------
-#  MENU
-# ------------------------------------------------------------------
 MENU_TEXT = f"""
 ╔══════════════════════════════╗
       👾   {BRAND}   👾
 ╚══════════════════════════════╝
 
 ╭━━━━━ 👾 𝐀𝐃𝐌𝐈𝐍 ━━━━━╮
-┃ 👾 .admins / .addadmin / .deladmin
+┃ 👾 .admins       » admin list
+┃ 👾 .addadmin     » add admin
+┃ 👾 .deladmin     » remove admin
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐂𝐇𝐀𝐓 ━━━━━━╮
-┃ 👾 .id / .chatinfo / .pin / .unpin
-┃ 👾 .gc <name> / .leave
+┃ 👾 .id / .chatinfo
+┃ 👾 .gc <name>    » create gc
+┃ 👾 .pin / .unpin / .leave
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐌𝐔𝐓𝐄 ━━━━━━╮
@@ -639,18 +455,31 @@ MENU_TEXT = f"""
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐆𝐑𝐎𝐔𝐏 ━━━━━╮
-┃ 👾 .purge / .throw / .add / .addall / .addbots
+┃ 👾 .purge / .throw
+┃ 👾 .add / .addall / .addbots
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐑𝐀𝐈𝐃 ━━━━━━╮
-┃ 👾 .reply / .rr / .flag / .replyshadow
-┃ 👾 .hrr / .replygod
-┃ 👾 .sreply / .srr / .sflag / .sshadow / .shr
-┃ 👾 .raid / .swipe / .sraid / .sswipe
+┃ 👾 .reply / .sreply
+┃ 👾 .rr / .srr
+┃ 👾 .flag / .sflag
+┃ 👾 .replyshadow / .sshadow
+┃ 👾 .raid / .sraid
+┃ 👾 .swipe / .sswipe
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐒𝐏𝐀𝐌 ━━━━━━╮
-┃ 👾 .spray / .dspray / .fastgc
+┃ 👾 .spray / .dspray
+┃ 👾 .fastgc set/stop
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━ 👾 𝐀𝐔𝐓𝐎 ━━━━━━╮
+┃ 👾 .ar <emoji> / .sar
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━ 👾 𝐂𝐋𝐄𝐀𝐑 ━━━━━╮
+┃ 👾 .clear on/off   » nuke service msgs
+┃ 👾 .clear stats    » nuke counters
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐒𝐍𝐈𝐏𝐄 ━━━━━╮
@@ -659,7 +488,6 @@ MENU_TEXT = f"""
 
 ╭━━━━━ 👾 𝐓𝐎𝐎𝐋𝐒 ━━━━━╮
 ┃ 👾 .dl / .music / .voice / .weather
-┃ 👾 .clear on/off  » auto-delete GC changes
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐏𝐑𝐎𝐅𝐈𝐋𝐄 ━━━╮
@@ -668,8 +496,12 @@ MENU_TEXT = f"""
 
 ╭━━━━━ 👾 𝐒𝐘𝐒 ━━━━━━━╮
 ┃ 👾 .ping / .status / .stats / .health
-┃ 👾 .backup / .restore / .reload / .stopall
-┃ 👾 .debug on/off
+┃ 👾 .backup / .restore / .reload
+┃ 👾 .debug on/off / .stopall
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━ 👾 𝐅𝐔𝐍 ━━━━━━━╮
+┃ 👾 .flip / .dice / .info
 ╰━━━━━━━━━━━━━━━━━━━━╯
 """.strip()
 
@@ -966,7 +798,8 @@ async def _invite_and_promote(chat_id: int, username: str) -> str:
                 result = "added"
             except Exception as ie:
                 s = str(ie)
-                if "USER_ALREADY_PARTICIPANT" in s or "already" in s.lower(): result = "already"
+                if "USER_ALREADY_PARTICIPANT" in s or "already" in s.lower():
+                    result = "already"
                 else: return "failed"
         elif is_basic:
             try:
@@ -974,7 +807,8 @@ async def _invite_and_promote(chat_id: int, username: str) -> str:
                 result = "added"
             except Exception as ie:
                 s = str(ie)
-                if "USER_ALREADY_PARTICIPANT" in s or "already" in s.lower(): result = "already"
+                if "USER_ALREADY_PARTICIPANT" in s or "already" in s.lower():
+                    result = "already"
                 else: return "failed"
         else: return "failed"
         if is_channel:
@@ -991,10 +825,6 @@ async def _invite_and_promote(chat_id: int, username: str) -> str:
             try:
                 await bot(EditChatAdminRequest(chat_id=chat.id, user_id=ent, is_admin=True))
             except Exception: pass
-        try:
-            if ent and getattr(ent, "id", None):
-                _our_bot_ids_cache.add(int(ent.id))
-        except Exception: pass
         return "promoted" if result == "already" else result
     except Exception as e:
         LOG.warning(f"invite {username} failed: {e}")
@@ -1071,11 +901,6 @@ async def cmd_rr(event, arg):          await _toggle_target(event, arg, rr_users
 async def cmd_flag(event, arg):        await _toggle_target(event, arg, flag_users,        "flag")
 @register_cmd("replyshadow", needs_reply=True)
 async def cmd_replyshadow(event, arg): await _toggle_target(event, arg, replyshadow_users, "shadow")
-@register_cmd("replygod",    needs_reply=True)
-async def cmd_replygod(event, arg):    await _toggle_target(event, arg, replyshadow_users, "replygod")
-@register_cmd("hrr",         needs_reply=True)
-async def cmd_hrr(event, arg):         await _toggle_target(event, arg, hrr_users,         "heart raid")
-
 @register_cmd("sreply")
 async def cmd_sreply(event, arg):      await _stop_target(event, arg, reply_users,       "reply raid")
 @register_cmd("srr")
@@ -1084,8 +909,6 @@ async def cmd_srr(event, arg):         await _stop_target(event, arg, rr_users, 
 async def cmd_sflag(event, arg):       await _stop_target(event, arg, flag_users,        "flag")
 @register_cmd("sshadow")
 async def cmd_sshadow(event, arg):     await _stop_target(event, arg, replyshadow_users, "shadow")
-@register_cmd("shr")
-async def cmd_shr(event, arg):         await _stop_target(event, arg, hrr_users,         "heart raid")
 
 async def _raid_worker(chat, reply_to_id: int, chat_id: int):
     try:
@@ -1283,6 +1106,102 @@ async def cmd_seen(event, arg):
            f"▸ ago  : {human_uptime(dt)}\n▸ text : {last.get('text','')[:300]}")
     await safe_edit(event, txt)
 
+
+# ---------- yt-dlp + music ----------
+def _ydl_youtube_opts(base: dict) -> dict:
+    """YouTube bot-check bypass + cookies attach."""
+    opts = dict(base)
+    ea = opts.setdefault("extractor_args", {})
+    ea["youtube"] = {
+        "player_client": ["android", "ios", "web_safari", "web", "tv_embedded"],
+        "player_skip": ["webpage", "configs"],
+    }
+    for ck_dir in (DATA_DIR, BASE_DIR):
+        ck = ck_dir / "cookies.txt"
+        if ck.exists():
+            opts["cookiefile"] = str(ck)
+            break
+    for cf_dir in (DATA_DIR, BASE_DIR):
+        cf = cf_dir / "cookies_from_browser.txt"
+        if cf.exists():
+            try:
+                br = cf.read_text(encoding="utf-8").strip().lower()
+                if br in ("chrome", "edge", "firefox", "brave", "opera", "chromium"):
+                    opts["cookiesfrombrowser"] = (br,)
+            except Exception: pass
+            break
+    return opts
+
+
+def _yt_dlp_try(query: str, out_dir: str) -> Optional[str]:
+    """Try yt-dlp with different strategies. Return path or None."""
+    import glob
+    strategies = [
+        {"format": "bestaudio/best", "extractor_args": {"youtube": {
+            "player_client": ["android"], "player_skip": ["webpage"]}}},
+        {"format": "bestaudio/best", "extractor_args": {"youtube": {
+            "player_client": ["ios"], "player_skip": ["webpage"]}}},
+        {"format": "bestaudio/best", "extractor_args": {"youtube": {
+            "player_client": ["web_safari"]}}},
+        {"format": "bestaudio/best"},
+    ]
+    for i, strat in enumerate(strategies):
+        opts = _ydl_youtube_opts({
+            "outtmpl": os.path.join(out_dir, "vn_%(id)s.%(ext)s"),
+            "quiet": True, "no_warnings": True,
+            "default_search": "ytsearch1",
+            "noplaylist": True, "retries": 2,
+            "socket_timeout": 15,
+            **strat,
+        })
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(query, download=True)
+            if "entries" in info: info = info["entries"][0]
+            vid = info.get("id")
+            files = glob.glob(os.path.join(out_dir, f"vn_{vid}.*"))
+            files = [f for f in files if not f.endswith((".part", ".ytdl"))]
+            if files:
+                return files[0]
+        except Exception as e:
+            LOG.warning(f"yt-dlp strategy {i} failed: {str(e)[:80]}")
+            continue
+    return None
+
+
+def _invidious_fallback(query: str, out_dir: str) -> Optional[str]:
+    """Fallback via invidious instances if yt-dlp dies."""
+    instances = [
+        "https://inv.nadeko.net",
+        "https://yewtu.be",
+        "https://invidious.nerdvpn.de",
+        "https://inv.tux.pizza",
+    ]
+    try:
+        r = requests.get(
+            f"https://invidious.nerdvpn.de/api/v1/search?q={requests.utils.quote(query)}&type=video",
+            timeout=10).json()
+        if not r: return None
+        vid = r[0].get("videoId")
+        if not vid: return None
+    except Exception:
+        return None
+    for inst in instances:
+        try:
+            url = f"{inst}/latest_version?id={vid}&itag=140"
+            resp = requests.get(url, timeout=20, stream=True)
+            if resp.status_code != 200: continue
+            path = os.path.join(out_dir, f"vn_{vid}.m4a")
+            with open(path, "wb") as f:
+                for chunk in resp.iter_content(64 * 1024):
+                    if chunk: f.write(chunk)
+            if os.path.getsize(path) > 10_000:
+                return path
+        except Exception:
+            continue
+    return None
+
+
 @register_cmd("dl")
 async def cmd_dl(event, arg):
     if not arg: return await safe_edit(event, "Use: .dl <url>")
@@ -1300,6 +1219,9 @@ async def cmd_dl(event, arg):
                 "quiet": True, "no_warnings": True,
                 "nocheckcertificate": True, "retries": 5,
                 "noplaylist": False, "ignoreerrors": True,
+                "user_agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/120.0.0.0 Safari/537.36"),
             })
             def run():
                 with yt_dlp.YoutubeDL(opts) as ydl: return ydl.extract_info(url, download=True)
@@ -1325,116 +1247,35 @@ async def cmd_dl(event, arg):
             await safe_edit(event, f"👾 {str(e)[:120]}")
     asyncio.create_task(dl_task())
 
-# ---------- .music — YouTube 2026 hardened ----------
 @register_cmd("music")
 async def cmd_music(event, arg):
     if not arg: return await safe_edit(event, "Use: .music <song>")
     query = arg.strip()
     await safe_edit(event, f"Searching: {query}")
-
     async def dl_task():
-        mp3_path = None
-        ogg_path = None
         try:
-            import glob
             loop = asyncio.get_event_loop()
-
-            opts = _ydl_youtube_opts({
-                "format": "bestaudio/best",
-                "outtmpl": os.path.join(str(TMP_DIR), "vn_%(id)s.%(ext)s"),
-                "quiet": True, "no_warnings": True,
-                "default_search": "ytsearch1",
-                "noplaylist": True, "retries": 3,
-                "nocheckcertificate": True,
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "128",
-                }],
-            })
-
-            def run():
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    return ydl.extract_info(query, download=True)
-
-            info = await loop.run_in_executor(None, run)
-            if isinstance(info, dict) and "entries" in info and info["entries"]:
-                info = info["entries"][0]
-
-            vid   = info.get("id") if isinstance(info, dict) else None
-            title = (info.get("title") if isinstance(info, dict) else None) or query
-            dur   = (info.get("duration") if isinstance(info, dict) else 0) or 0
-            dtext = f"{dur // 60}:{dur % 60:02d}"
-
-            if not vid:
-                return await safe_edit(event, "Download failed — no video id")
-
-            candidates = glob.glob(os.path.join(str(TMP_DIR), f"vn_{vid}.*"))
-            mp3s = [f for f in candidates if f.lower().endswith(".mp3")]
-            if not mp3s:
-                audio_exts = (".m4a", ".webm", ".opus", ".ogg", ".aac", ".wav", ".mp4")
-                fallback = [f for f in candidates if f.lower().endswith(audio_exts)]
-                if not fallback:
-                    return await safe_edit(event, "Download failed — no audio file")
-                mp3_path = fallback[0]
-            else:
-                mp3_path = mp3s[0]
-
-            clean = re.sub(r"[^\w\s-]", "", title).strip()[:40] or "audio"
+            out_dir = str(TMP_DIR)
+            path = await loop.run_in_executor(None, _yt_dlp_try, query, out_dir)
+            if not path:
+                await safe_edit(event, "yt-dlp failed — trying invidious fallback...")
+                path = await loop.run_in_executor(None, _invidious_fallback, query, out_dir)
+            if not path:
+                return await safe_edit(event,
+                    "👾 Music failed on all methods.\n"
+                    "▸ yt-dlp: blocked\n"
+                    "▸ invidious: no mirror reachable\n"
+                    "▸ Fix: add cookies.txt in DATA_DIR, ya direct URL bhej `.music <url>`")
+            clean = re.sub(r"[^\w\s-]", "", query).strip()[:40] or "audio"
             await safe_edit(event, f"Sending: {clean}")
-
-            voice_ready = None
-            if mp3_path.lower().endswith(".mp3"):
-                voice_ready = _mp3_to_ogg_opus(mp3_path)
-                ogg_path = voice_ready
-
-            if voice_ready and os.path.exists(voice_ready):
-                await bot.send_file(
-                    event.chat_id, voice_ready, voice_note=True,
-                    caption=f"Music\n{clean}\n{dtext}",
-                )
-            else:
-                await bot.send_file(
-                    event.chat_id, mp3_path,
-                    caption=f"Music\n{clean}\n{dtext}",
-                    attributes=[],
-                )
-
+            await bot.send_file(event.chat_id, path,
+                                voice_note=True, caption=f"Music\n{clean}")
+            try: os.remove(path)
+            except Exception: pass
             await safe_delete(event)
-
         except Exception as e:
-            LOG.warning(f"music: {e}\n{traceback.format_exc()}")
-            err = str(e)
-            if "Sign in to confirm" in err or "bot" in err.lower() and "youtube" in err.lower():
-                await safe_edit(event,
-                    "👾 YouTube bot-check.\n"
-                    "▸ 1) pip install -U yt-dlp-ejs bgutil-ytdlp-pot-provider\n"
-                    "▸ 2) install deno (JS runtime)\n"
-                    "▸ 3) restart the userbot\n"
-                    "▸ 4) if still fails: cookies.txt in DATA_DIR\n"
-                    "▸ check: .health")
-            elif "PO Token" in err or "GVS" in err:
-                await safe_edit(event,
-                    "👾 PO Token missing.\n"
-                    "▸ pip install -U bgutil-ytdlp-pot-provider\n"
-                    "▸ node >= 22 or deno >= 2.0")
-            elif "n challenge" in err or "JS runtime" in err:
-                await safe_edit(event,
-                    "👾 n-challenge solver missing.\n"
-                    "▸ pip install -U yt-dlp-ejs\n"
-                    "▸ install deno or node")
-            elif "Requested format is not available" in err:
-                await safe_edit(event,
-                    "👾 Format selector miss.\n"
-                    "▸ retry with .dl <url> to grab the raw file")
-            else:
-                await safe_edit(event, f"Music error: {err[:120]}")
-        finally:
-            for p in (mp3_path, ogg_path):
-                if p:
-                    try: os.remove(p)
-                    except Exception: pass
-
+            LOG.warning(f"music: {e}")
+            await safe_edit(event, f"Music error: {str(e)[:100]}")
     asyncio.create_task(dl_task())
 
 @register_cmd("voice")
@@ -1607,10 +1448,8 @@ async def cmd_status(event, _):
            f"▸ muted  : {local_muted} local / {len(global_muted)} global\n"
            f"▸ raids  : {len(raid_tasks)}\n▸ sprays : {len(spray_tasks)}\n"
            f"▸ swipes : {len(swipe_tasks)}\n▸ mode   : operational\n"
-           f"▸ clear  : service={'ON' if ST.data.get('auto_clear_titles') else 'OFF'} "
-           f"bots={'ON' if ST.data.get('auto_clear_bot_msgs') else 'OFF'}\n"
-           f"▸ hrr    : {len(hrr_users)} targets\n"
-           f"▸ our bots cached: {len(_our_bot_ids_cache)}")
+           f"▸ clear  : {'ON' if ST.data.get('auto_clear_titles') else 'OFF'} · "
+           f"q={_nuke_queue.qsize()}")
     await safe_edit(event, txt)
 
 @register_cmd("stats")
@@ -1638,25 +1477,9 @@ async def cmd_health(event, _):
         results.append(f"▸ yt-dlp   : {_y.version.__version__}")
     except Exception:
         results.append("▸ yt-dlp   : FAIL")
-    try:
-        import yt_dlp_ejs as _ejs  # noqa
-        results.append("▸ yt-dlp-ejs : yes")
-    except Exception:
-        results.append("▸ yt-dlp-ejs : NO (pip install yt-dlp-ejs)")
-    try:
-        import bgutil_ytdlp_pot_provider as _pot  # noqa
-        results.append("▸ pot plugin : yes")
-    except Exception:
-        results.append("▸ pot plugin : NO (pip install bgutil-ytdlp-pot-provider)")
-    results.append(f"▸ deno     : {'yes' if shutil.which('deno') else 'NO'}")
-    results.append(f"▸ node     : {'yes' if shutil.which('node') else 'NO'}")
-    results.append(f"▸ ffmpeg   : {'yes' if _ffmpeg_available() else 'NO (voice-note fallback = mp3)'}")
     ck = DATA_DIR / "cookies.txt"
     results.append(f"▸ cookies  : {'yes' if ck.exists() else 'no'}")
-    results.append(f"▸ our bots : {len(_our_bot_ids_cache)} cached")
-    results.append(f"▸ me       : {_my_userbot_id}")
     results.append(f"▸ data dir : {DATA_DIR}")
-    results.append(f"▸ queue    : {_nuke_queue.qsize()} pending")
     txt = "👾 health 👾\n" + "\n".join(results)
     await safe_edit(event, txt)
 
@@ -1686,7 +1509,7 @@ async def cmd_restore(event, _):
         ST.data = {**_DEFAULT_STATE, **data}
         ST.save()
         global admins, global_muted, group_locks, muted_users
-        global reply_users, rr_users, flag_users, replyshadow_users, hrr_users
+        global reply_users, rr_users, flag_users, replyshadow_users
         global menu_banner_msg, auto_react_emoji
         admins = set(int(x) for x in ST.data.get("admins", []))
         global_muted = set(int(x) for x in ST.data.get("gmutes", []))
@@ -1697,7 +1520,6 @@ async def cmd_restore(event, _):
         rr_users          = set(int(x) for x in ST.data.get("rr_targets", []))
         flag_users        = set(int(x) for x in ST.data.get("flag_targets", []))
         replyshadow_users = set(int(x) for x in ST.data.get("shadow_targets", []))
-        hrr_users         = set(int(x) for x in ST.data.get("hrr_targets", []))
         menu_banner_msg = tuple(ST.data["banner"]) if ST.data.get("banner") else None
         auto_react_emoji = ST.data.get("auto_react")
         await safe_edit(event, "👾 Restored")
@@ -1708,7 +1530,7 @@ async def cmd_restore(event, _):
 async def cmd_reload(event, _):
     ST.load()
     global admins, global_muted, group_locks, muted_users
-    global reply_users, rr_users, flag_users, replyshadow_users, hrr_users
+    global reply_users, rr_users, flag_users, replyshadow_users
     global menu_banner_msg, auto_react_emoji
     admins = set(int(x) for x in ST.data.get("admins", []))
     global_muted = set(int(x) for x in ST.data.get("gmutes", []))
@@ -1719,7 +1541,6 @@ async def cmd_reload(event, _):
     rr_users          = set(int(x) for x in ST.data.get("rr_targets", []))
     flag_users        = set(int(x) for x in ST.data.get("flag_targets", []))
     replyshadow_users = set(int(x) for x in ST.data.get("shadow_targets", []))
-    hrr_users         = set(int(x) for x in ST.data.get("hrr_targets", []))
     menu_banner_msg = tuple(ST.data["banner"]) if ST.data.get("banner") else None
     auto_react_emoji = ST.data.get("auto_react")
     await safe_edit(event, "👾 Reloaded from disk")
@@ -1777,7 +1598,6 @@ async def cmd_stopall(event, _):
     if rr_users:          rr_users.clear();          stopped.append("rr")
     if flag_users:        flag_users.clear();        stopped.append("flag")
     if replyshadow_users: replyshadow_users.clear(); stopped.append("shadow")
-    if hrr_users:         hrr_users.clear();         stopped.append("hrr")
     if auto_react_emoji:  auto_react_emoji = None;   stopped.append("ar")
     if group_locks:       group_locks.clear();       stopped.append("locks")
     if muted_users:       muted_users.clear();       stopped.append("mutes")
@@ -1793,52 +1613,27 @@ async def cmd_stopall(event, _):
     txt = ("👾 Everything stopped\n" + ", ".join(stopped)) if stopped else "👾 Nothing was active"
     await safe_edit(event, txt)
 
-# ---------- .clear ----------
 @register_cmd("clear")
 async def cmd_clear(event, arg):
     arg = (arg or "").strip().lower()
-
-    # hidden subcommand — other bots' text nuke
-    if arg.startswith("bots"):
-        sub = arg[4:].strip()
-        if sub == "on":    state = True
-        elif sub == "off": state = False
-        else:              state = not ST.data.get("auto_clear_bot_msgs", False)
-        ST.data["auto_clear_bot_msgs"] = state
-        ST.save()
-        return await safe_edit(
-            event,
-            f"👾 other-bots nuke ➤ {'ON' if state else 'OFF'}\n"
-            f"▸ every bot EXCEPT SHADOW bots, owner, admins",
-        )
-
     if arg == "on":    state = True
     elif arg == "off": state = False
+    elif arg == "stats":
+        return await safe_edit(event,
+            f"👾 nuke stats\n▸ hits    : {_nuke_stats['hits']}\n"
+            f"▸ deleted : {_nuke_stats['deleted']}\n"
+            f"▸ calls   : {_nuke_stats['calls']}\n"
+            f"▸ queue   : {_nuke_queue.qsize()} pending")
     else:              state = not ST.data.get("auto_clear_titles", False)
     ST.data["auto_clear_titles"] = state
     ST.save()
-    await safe_edit(
-        event,
-        f"👾 GC auto-clear ➤ {'ON' if state else 'OFF'}\n"
-        f"▸ deletes : every service msg (title, photo, pin, join, leave, TTL, theme)\n"
-        f"▸ use     : `.clear on` / `.clear off`",
-    )
-
-@register_cmd("botid")
-async def cmd_botid(event, arg):
-    global _our_bot_cache_loaded
-    if not arg: return await safe_edit(event, "Use: .botid <username>")
-    uname = arg.strip().lstrip("@")
-    try:
-        ent = await resolve_bot(uname)
-        if not ent or not getattr(ent, "id", None):
-            return await safe_edit(event, f"❌ {uname} not found")
-        uid = int(ent.id)
-        _our_bot_ids_cache.add(uid)
-        _our_bot_cache_loaded = True
-        await safe_edit(event, f"✅ cached:\n@{uname} → `{uid}`\nTotal: {len(_our_bot_ids_cache)}")
-    except Exception as e:
-        await safe_edit(event, f"❌ {str(e)[:80]}")
+    await safe_edit(event,
+        f"👾 auto-clear service msgs ➤ {'ON' if state else 'OFF'}\n"
+        f"▸ scope: chat title + photo change notifications\n"
+        f"▸ mode : batched ({_NUKE_WORKERS}w · {_NUKE_BATCH_MAX}/call · "
+        f"{int(_NUKE_WINDOW_IDLE*1000)}→{int(_NUKE_WINDOW_STORM*1000)}ms)\n"
+        f"▸ stats: {_nuke_stats['hits']} hits · {_nuke_stats['deleted']} deleted · "
+        f"{_nuke_stats['calls']} calls")
 
 @register_cmd("flip")
 async def cmd_flip(event, _):
@@ -1876,9 +1671,71 @@ async def cmd_info(event, arg):
         await safe_edit(event, f"Error: {str(e)[:60]}")
 
 
+# ---------- nuke system ----------
+_NUKE_WORKERS       = 8
+_NUKE_BATCH_MAX     = 100
+_NUKE_WINDOW_IDLE   = 0.003
+_NUKE_WINDOW_STORM  = 0.025
+_NUKE_STORM_TRIGGER = 25
+_nuke_queue: "asyncio.Queue" = asyncio.Queue()
+_peer_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+_nuke_stats = {"hits": 0, "deleted": 0, "calls": 0}
+
+_SERVICE_ACTIONS = (
+    types.MessageActionChatEditTitle,
+    types.MessageActionChatEditPhoto,
+    types.MessageActionChatDeletePhoto,
+)
+
+async def _nuke_delete_peer(peer: int, ids: list):
+    async with _peer_locks[peer]:
+        try:
+            await bot.delete_messages(peer, ids)
+            _nuke_stats["deleted"] += len(ids)
+            _nuke_stats["calls"]   += 1
+            return
+        except FloodWaitError as fw:
+            await asyncio.sleep(fw.seconds + 0.05)
+            try:
+                await bot.delete_messages(peer, ids)
+                _nuke_stats["deleted"] += len(ids)
+                _nuke_stats["calls"]   += 1
+            except Exception: pass
+        except Exception: pass
+
+async def _nuke_worker():
+    while True:
+        try:
+            first = await _nuke_queue.get()
+            batch = [first]
+            deadline = time.monotonic() + _NUKE_WINDOW_IDLE
+            extended = False
+            while len(batch) < _NUKE_BATCH_MAX:
+                left = deadline - time.monotonic()
+                if left <= 0: break
+                try:
+                    item = await asyncio.wait_for(_nuke_queue.get(), timeout=left)
+                    batch.append(item)
+                    if not extended and _nuke_queue.qsize() >= _NUKE_STORM_TRIGGER:
+                        extended = True
+                        deadline = time.monotonic() + _NUKE_WINDOW_STORM
+                except asyncio.TimeoutError:
+                    break
+            by_peer: Dict[int, list] = {}
+            for p, m in batch:
+                by_peer.setdefault(p, []).append(m)
+            await asyncio.gather(
+                *(_nuke_delete_peer(p, ids) for p, ids in by_peer.items()),
+                return_exceptions=True,
+            )
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            pass
+
+
 # ---------- userbot event handlers ----------
 if bot is not None:
-
     @bot.on(events.NewMessage)
     async def on_new_incoming(event):
         if event.out: return
@@ -1946,9 +1803,6 @@ if bot is not None:
             if sender in reply_users:
                 try: await event.reply(random.choice(reply_list))
                 except Exception: pass
-            if sender in hrr_users:
-                try: await event.reply(random.choice(heart_replies))
-                except Exception: pass
             if sender in replyshadow_users:
                 try:
                     for _ in range(3):
@@ -1969,30 +1823,6 @@ if bot is not None:
                 except Exception: pass
         except Exception: pass
 
-    @bot.on(events.NewMessage)
-    async def on_bot_msg_nuke(event):
-        if not ST.data.get("auto_clear_bot_msgs"):
-            return
-        sender = event.sender_id
-        if not sender: return
-        if sender in _our_bot_ids_cache: return
-        if sender == OWNER_ID or sender in admins: return
-        if _my_userbot_id is not None and sender == _my_userbot_id: return
-        try:
-            s = await event.get_sender()
-            if not getattr(s, "bot", False):
-                return
-        except Exception:
-            return
-        try:
-            await event.delete()
-        except FloodWaitError as fw:
-            await asyncio.sleep(min(fw.seconds, 1.0))
-            try: await event.delete()
-            except Exception: pass
-        except Exception:
-            pass
-
     @bot.on(events.NewMessage(outgoing=True))
     async def on_auto_react(event):
         e = auto_react_emoji
@@ -2004,23 +1834,23 @@ if bot is not None:
                 reaction=[ReactionEmoji(emoticon=e)]))
         except Exception: pass
 
-    # ------------------------------------------------------------------
-    #  .clear — fires on every service message
-    # ------------------------------------------------------------------
-    @bot.on(events.NewMessage)
+    @bot.on(events.Raw(types=[
+        types.UpdateNewChannelMessage,
+        types.UpdateNewMessage,
+        types.UpdateEditChannelMessage,
+        types.UpdateEditMessage,
+    ]))
     async def on_service_clear(event):
         if not ST.data.get("auto_clear_titles"):
             return
-        if getattr(event, "action", None) is None:
+        msg = getattr(event, "message", None)
+        if msg is None or not isinstance(msg, types.MessageService):
             return
-        try:
-            await event.delete()
-        except FloodWaitError as fw:
-            await asyncio.sleep(min(fw.seconds, 2.0))
-            try: await event.delete()
-            except Exception: pass
-        except Exception:
-            pass
+        action = getattr(msg, "action", None)
+        if not isinstance(action, _SERVICE_ACTIONS):
+            return
+        _nuke_stats["hits"] += 1
+        _nuke_queue.put_nowait((msg.peer_id, msg.id))
 
     @bot.on(events.NewMessage(outgoing=True))
     async def on_command(event):
@@ -2044,6 +1874,7 @@ if bot is not None:
 
 
 _shutdown_done = False
+_nuke_tasks: list = []
 
 async def _graceful_shutdown():
     global _shutdown_done
@@ -2055,6 +1886,9 @@ async def _graceful_shutdown():
             try: tmap[c].cancel()
             except Exception: pass
             tmap.pop(c, None)
+    for t in _nuke_tasks:
+        try: t.cancel()
+        except Exception: pass
     t = FASTGC_STATE.get("task")
     if t: t.cancel()
     persist()
@@ -2071,20 +1905,20 @@ async def userbot_main():
         await bot.start(phone=PHONE)
         me = await bot.get_me()
         un = f"@{me.username}" if me.username else "NoUsername"
-        print("=" * 44)
+        print("=" * 52)
         print(f"  👾  {BRAND}  👾")
         print(f"  logged in : {me.first_name} ({un})")
         print(f"  user id   : {me.id}")
         print(f"  session   : {SESSION}.session")
         print(f"  data dir  : {DATA_DIR}")
-        print("=" * 44)
+        print("=" * 52)
         LOG.info(f"userbot online · {len(commands)} commands")
-        try:
-            await _ensure_our_bot_ids()
-        except Exception as e:
-            LOG.warning(f"our-bot cache load failed: {e}")
-        asyncio.create_task(_nuke_worker())
-        LOG.info("nuke worker online")
+
+        # spawn nuke workers
+        for _ in range(_NUKE_WORKERS):
+            _nuke_tasks.append(asyncio.create_task(_nuke_worker()))
+        LOG.info(f"nuke workers online: {_NUKE_WORKERS}")
+
         try:
             await bot.run_until_disconnected()
         except (ConnectionError, OSError) as e:
@@ -2098,7 +1932,7 @@ async def userbot_main():
 
 
 # ==================================================================
-#  SECTION 2 — ONBOARDING BOT
+#  SECTION 2 — ONBOARDING BOT  (admin-approval gate)
 # ==================================================================
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -2109,6 +1943,31 @@ from telegram.ext import (
 
 CODE_LEN = 5
 ASK_API_ID, ASK_API_HASH, ASK_PHONE, ASK_CODE, ASK_PASSWORD = range(5)
+
+# ---- approval gate ----
+ADMIN_ID       = 8846085944
+APPROVAL_FILE  = BASE_DIR / "approved_users.json"
+PENDING_FILE   = BASE_DIR / "pending_users.json"
+
+
+def _load_id_set(path: Path) -> set:
+    try:
+        return set(int(x) for x in json.loads(path.read_text(encoding="utf-8")))
+    except Exception:
+        return set()
+
+
+def _save_id_set(path: Path, s: set) -> None:
+    try:
+        path.write_text(json.dumps(sorted(int(x) for x in s)), encoding="utf-8")
+    except Exception as e:
+        print(f"save {path.name} failed: {e}")
+
+
+APPROVED_USERS: set = _load_id_set(APPROVAL_FILE)
+PENDING_USERS:  set = _load_id_set(PENDING_FILE)
+APPROVED_USERS.add(ADMIN_ID)
+# ---- end approval gate ----
 
 _onboard_state: dict[int, dict] = {}
 _running: dict[int, dict] = {}
@@ -2187,8 +2046,41 @@ async def _close_telethon(chat_id: int):
         st["client"] = None
 
 
+# ---- /start (gated) ----
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    user    = update.effective_user
+
+    if chat_id != ADMIN_ID and chat_id not in APPROVED_USERS:
+        if chat_id not in PENDING_USERS:
+            PENDING_USERS.add(chat_id)
+            _save_id_set(PENDING_FILE, PENDING_USERS)
+
+            name  = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip() or "unknown"
+            uname = f"@{user.username}" if user.username else "no username"
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data=f"appr:{chat_id}"),
+                InlineKeyboardButton("❌ Reject",  callback_data=f"rej:{chat_id}"),
+            ]])
+            try:
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    "🔔 ɴᴇᴡ ᴀᴄᴄᴇꜱꜱ ʀᴇQᴜᴇꜱᴛ\n\n"
+                    f"▸ name     : {name}\n"
+                    f"▸ username : {uname}\n"
+                    f"▸ user id  : `{chat_id}`",
+                    reply_markup=kb,
+                )
+            except Exception as e:
+                print(f"admin notify failed: {e}")
+
+        await context.bot.send_message(
+            chat_id,
+            "⏳ Aapki request admin ko bhej di gayi hai.\n"
+            "Approve hone ke baad /start dobara bhejein.",
+        )
+        return ConversationHandler.END
+
     await _kill_running(chat_id, do_logout=True)
     await _close_telethon(chat_id)
     _onboard_state[chat_id] = {"bot_msg_ids": []}
@@ -2293,7 +2185,8 @@ async def got_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot, chat_id,
         "Code sent to your Telegram app.\n\n"
         "Step 4/4 — Enter the 5-digit code, ONE DIGIT AT A TIME.\n"
-        "Example: send `1`, then `2`, then `3`, then `4`, then `5`.\n\n"
+        "Example: send `1`, then `2`, then `3`, then `4`, then `5`.\n"
+        "The bot joins them into 12345 on its own.\n\n"
         "digit 1/5 :",
     )
     return ASK_CODE
@@ -2326,7 +2219,8 @@ async def got_code_digit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except SessionPasswordNeededError:
         st["digits"] = []
         await _track(context.bot, chat_id,
-                     "2FA password required.\n\nSend your cloud password now.")
+                     "2FA password required.\n\nSend your cloud password now.\n"
+                     "The message you send will be deleted automatically.")
         return ASK_PASSWORD
     except PhoneCodeInvalidError:
         st["digits"] = []
@@ -2434,14 +2328,59 @@ async def _finalize(update, context, chat_id: int):
         chat_id,
         "✅ Login successful.\n\n"
         "Your userbot is now running 24/7.\n"
-        "Try `.menu` in any chat.\n\n"
-        "`.clear on` → auto-delete every GC service msg (title/photo/pin/join).\n"
-        "`.music <song>` → downloads + sends as voice note (needs ffmpeg + deno).\n\n"
-        "Press the button below to log out completely.",
+        "All commands are live — try `.menu` in any chat.\n\n"
+        "`.clear on` → nuke every GC title/photo change msg.\n"
+        "`.clear stats` → live nuke counters.\n"
+        "`.music <song>` → 4 yt-dlp strategies + invidious fallback.\n\n"
+        "Press the button below to log out completely at any time.",
         reply_markup=kb,
     )
     st["finalized"] = True
     return ConversationHandler.END
+
+
+async def approval_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    if q.from_user.id != ADMIN_ID:
+        return
+
+    try:
+        action, uid_s = q.data.split(":", 1)
+        uid = int(uid_s)
+    except Exception:
+        return
+
+    if action == "appr":
+        APPROVED_USERS.add(uid)
+        _save_id_set(APPROVAL_FILE, APPROVED_USERS)
+        PENDING_USERS.discard(uid)
+        _save_id_set(PENDING_FILE, PENDING_USERS)
+        try:
+            await q.edit_message_text(f"✅ ᴀᴘᴘʀᴏᴠᴇᴅ  ·  `{uid}`", parse_mode="Markdown")
+        except Exception: pass
+        try:
+            await context.bot.send_message(
+                uid,
+                "✅ Aapko approve kar diya gaya hai.\n"
+                "Ab /start bhejein shuru karne ke liye.",
+            )
+        except Exception:
+            pass
+
+    elif action == "rej":
+        PENDING_USERS.discard(uid)
+        _save_id_set(PENDING_FILE, PENDING_USERS)
+        APPROVED_USERS.discard(uid)
+        _save_id_set(APPROVAL_FILE, APPROVED_USERS)
+        try:
+            await q.edit_message_text(f"❌ ʀᴇᴊᴇᴄᴛᴇᴅ  ·  `{uid}`", parse_mode="Markdown")
+        except Exception: pass
+        try:
+            await context.bot.send_message(uid, "❌ Aapki request reject kar di gayi hai.")
+        except Exception:
+            pass
 
 
 async def logout_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2481,6 +2420,10 @@ async def logout_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def bot_main():
     app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CallbackQueryHandler(approval_cb, pattern=r"^(appr|rej):"))
+    app.add_handler(CallbackQueryHandler(logout_cb,   pattern=r"^logout$"))
+
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={
@@ -2495,11 +2438,14 @@ def bot_main():
         allow_reentry=True,
     )
     app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(logout_cb, pattern="^logout$"))
+
     print("onboarding bot online — /start in telegram")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
+# ==================================================================
+#  DISPATCH
+# ==================================================================
 if __name__ == "__main__":
     if IS_USERBOT:
         try:
