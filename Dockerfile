@@ -15,11 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # source
 COPY . .
 
-# persistent volume — session/state/cookies live here
+# persistent path — Railway Volumes will mount here
 ENV SHADOW_DATA_DIR=/data
 RUN mkdir -p /data
-VOLUME ["/data"]
 
 # polling bot — no PORT exposed
-# -u so Railway sees logs live (unbuffered stdout)
 CMD ["python", "-u", "shadow_all.py"]
