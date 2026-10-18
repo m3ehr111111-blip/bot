@@ -1233,8 +1233,13 @@ def _ydl_youtube_opts(base: dict) -> dict:
                     opts["cookiesfrombrowser"] = (br,)
             except Exception: pass
             break
+            
+    # ─── PROXY SETUP ───
+    proxy_url = "http://zncmleyo:ntpcpf1oxke0@198.23.243.226:6361"
+    opts["proxy"] = proxy_url
+    
     return opts
-
+    
 def _sc_try(query: str, out_dir: str):
     opts = {
         "outtmpl": os.path.join(out_dir, "vn_%(id)s.%(ext)s"),
