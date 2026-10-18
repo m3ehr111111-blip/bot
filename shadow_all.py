@@ -22,6 +22,8 @@ import subprocess
 import sys
 import time
 import traceback
+import ast
+import operator as op
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
@@ -264,49 +266,57 @@ SWIPE_MESSAGES = [
     "👾 ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʟᴜɴᴅ ᴅᴀᴀʟ ᴅᴜɴɢᴀ 👾",
     "👾 ᴛᴇʀᴀ ᴋʜᴀɴᴅᴀɴ ᴋʜᴀᴛᴍ ᴛᴇʀɪ ᴍᴀᴀ ꜱᴇ ꜱʜᴜʀᴜ ʜᴏᴛᴀ ʜᴀɪ 👾",
 ]
+
 reply_list = [
-    "ᴄʜᴜᴘ ᴋᴀʀ ʀᴀɴᴅɪ ᴋᴇ 👾", "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴀᴀɢ 👾",
-    "ᴋʏᴀ ʀᴇ ᴄʜᴏᴅᴜ ʀᴇᴘʟʏ ᴅᴇ 👾", "ᴛᴇʀɪ ʙᴇʜᴇɴ ʀᴀɴᴅɪ ʜᴀɪ 👾",
-    "ᴛᴇʀᴀ ʙᴀᴀᴘ ʜᴜ ᴍᴀɪ 👾", "ɢᴀᴀɴᴅ ᴍᴀʀᴀ ᴀᴘɴɪ ᴍᴀᴅᴀʀᴄʜᴏᴅ 👾",
-    "ꜱʜᴀᴋᴀʟ ᴅᴇᴋʜ ᴀᴘɴɪ 👾", "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ʙʜᴇᴊ ᴍᴇʀᴇ ᴘᴀᴀꜱ 👾",
-    "ᴄʜᴜᴅ ᴊᴀ ᴄʜᴜᴘᴄʜᴀᴘ 👾", "ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴇ ʟᴜɴᴅ 👾",
-    "ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ 👾", "ᴛᴇʀɪ ᴍᴀᴀ ᴄʜᴜᴅ ʀᴀʜɪ ʜᴀɪ 👾",
-    "ᴋʏᴀ ʀᴇ ɢᴀɴᴅᴜ 👾", "ᴛᴇʀᴀ ᴋʜᴀɴᴅᴀɴ ʀᴀɴᴅɪ ᴋʜᴀɴᴀ 👾",
-    "ᴀᴀ ᴊᴀ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀᴀʀᴜ 👾",
+    "𝐊ʏᴀ 𝐑ᴇ 𝐑ᴀɴᴅɪᴋᴇ 𝐂ᴏᴏʟ 𝐁ᴀɴᴇɢᴀ 𝐓ᴜ 𝐂ʜᴀʟ 𝐀ʙ 𝐂ʜᴜᴅ 𝐀ᴘɴᴇ 𝐁ᴀᴀᴘ 𝐒𝐇𝐀𝐃𝐎𝐖 𝐒ᴇ - 🦢💘 👾",
+    "𝐊ɪ 𝐌ᴀᴀ 𝐌ᴀʀʀ 𝐆ᴀʏɪ 𝐘ᴀᴀʀ - 𝐉ᴀɪ 𝐒𝐇𝐀𝐃𝐎𝐖 ! 🌙 👾",
+    "acha beta 😂🔥👊🏻 ? coi na me toh HATER codunga 😹💔🔥😆👊🏻💥 👾",
+    "chudke bhaga kaise 😂💥🤣🤘🏻 👾",
+    "ne toh 𝐒𝐇𝐀𝐃𝐎𝐖 ka lun muh me lelia 😂🙏🏻😂🙏🏻 👾",
+    "try maa सूर्य☀ nikalte hi pel du 😹🔥💔 👾",
+    "mkl lun te vaj 😂✊🏻💦 👾",
+    "𝗧ᴍᴋ𝗕 pe 𝐒𝐇𝐀𝐃𝐎𝐖 ka hamla 😂⚔🔥💥 👾",
+    "𝐂ʜʟ 𝐇ᴀʀᴍᴢᴀᴅ𝐈 𝐊ᴇ लड़के 💛🤍🩵 👾",
+    "oi 𝐓ᴇʀɪ 𝐌‌ᴀᴀ गुलाम ₰🖤 👾",
+    "chl rndyce chud ke dikha 😂💥🤣🔥 👾",
+    "𝐊ɪ 𝐌ᴀᴀ 𝐌ᴀʀʀ 𝐆ᴀʏɪ naacho 💃🏻💃🏻🕺🏻🎶😂😆💞🔥 ! 👾",
+    "tera baap bass 𝐒𝐇𝐀𝐃𝐎𝐖 hai 😂🎀 👾",
+    " try maa hagte hue paad mari -#😹🔥🥀 👾",
+    "  𝐓ᴇʀɪ 𝐌ᴜᴍᴍʏ 𝐂ʜᴏᴅ 𝐃ɪ 𝐒𝐇𝐀𝐃𝐎𝐖 𝐍ᴇ 𝐁ᴡᴀʜᴀʜᴀʜᴀ ⚜ 👾",
 ]
+
 reply_texts = [
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʟᴜɴᴅ ᴅᴀᴀʟ ᴅᴜɴɢᴀ 👾",
-    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ʀᴏᴢ ᴄʜᴏᴅᴛᴀ ʜᴜ ᴍᴀɪ 👾",
-    "ᴀᴘɴɪ ᴍᴀᴀ ᴋᴏ ʙᴏʟ ᴋᴇ ᴀᴀ 👾",
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴍᴇʀᴇ ᴘᴀᴀꜱ ʙʜᴇᴊ 👾",
-    "ᴄʜᴜᴘ ᴋᴀʀ ᴡʀɴᴀ ɢᴀᴀɴᴅ ᴍᴀʀ ᴅᴜɴɢᴀ 👾",
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ɢᴀᴀɴᴅ ᴄʜᴀᴛ ᴅᴜɴɢᴀ 👾",
-    "ʟᴜɴᴅ ᴘᴇ ʙᴀɪᴛʜ ᴊᴀ 👾",
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴅᴀɪ ᴅᴇᴋʜ ʟᴇ ᴀᴘɴɪ 👾",
-    "ɢᴀɴᴅᴜ ᴋᴀʜɪ ᴋᴀ 👾",
-    "ꜱʜᴀᴋᴀʟ ꜱᴇ ʜɪ ʀᴀɴᴅɪ ʟᴀɢᴛᴀ ʜᴀɪ 👾",
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ꜱᴀᴍʙʜᴀʟ ᴋᴇ ʀᴀᴋʜ 👾",
-    "ᴍᴀᴀ ᴄʜᴜᴅᴀ ᴀᴘɴɪ ʏᴀʜᴀ ꜱᴇ 👾",
+    "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद 𝐒𝐇𝐀𝐃𝐎𝐖 बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥 👾",
+    "नहीं नहीं तेरी मां को 𝐒ɪʀғ 𝐒𝐇𝐀𝐃𝐎𝐖 बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ??? 👾",
+    "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱 👾",
+    "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥 👾",
+    "सोच तेरी बहन को 𝐒𝐇𝐀𝐃𝐎𝐖 बाप का गुलाम चोद रहा 😎🔥 👾",
+    "Hello hello?? Oxygen aarahi है? रण्डी पुत्र 🧘🏻 👾",
+    "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन 𝐒𝐇𝐀𝐃𝐎𝐖 /\\~ 👑 बाप से सही chudi 🥵🔥 👾",
+    "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ 𝐒𝐇𝐀𝐃𝐎𝐖 बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥 👾",
+    "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝐒𝐻 𝑀𝐸 तेरी मां घर घर जाके MOAN करती है ! 🛐 👾",
 ]
+
 fun_texts = [
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴇ ʙʜᴏꜱᴅᴇ ᴍᴇ ᴍᴇʀᴀ ʟᴜɴᴅ ꜰᴀꜱ ɢᴀʏᴀ 👾",
-    "ᴋʏᴀ ʀᴇ ᴄʜᴏᴅᴜ ʀᴇᴘʟʏ ɴᴀʜɪ ᴋᴀʀ ʀᴀʜᴀ 👾",
-    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ᴄʜᴏᴅ ᴄʜᴜᴋᴀ ʜᴜ ᴍᴀɪ 👾",
-    "ᴀᴘɴɪ ᴍᴀᴀ ᴋɪ ꜱʜᴀᴋᴀʟ ᴅᴇᴋʜ ʟᴇ 👾",
-    "ɢᴀᴀɴᴅ ᴍᴀʀᴀ ʟᴇ ᴀᴘɴɪ 👾",
-    "ᴋʏᴀ ʀᴇ ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜʜᴇ 👾",
-    "ᴄʜᴜᴅ ᴊᴀ ʙʜᴀɪ ᴄʜᴜᴘᴄʜᴀᴘ 👾",
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴀᴀɢ ʟᴀɢᴀ ᴅᴜɴɢᴀ 👾",
+    "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 🤪（ ͜.🍆 ͜.） 👾",
+    "𝐓ᴇʀʏ 𝐁ʜᴇ𝐍 𝐊ᴇ ( ͜. ㅅ ͜. )🥛 ʏᴜᴍᴍʏ 👾",
+    "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃 👾",
+    "˙✧˖°📷༘ ⋆｡° 𝐓ᴇʀʏ 𝐌ᴀ 𝐊ᴀ 𝐂ʜɪʟᴅ 𝐏ᴏʀɴ 𝐑ᴇᴄᴏʀᴅ 𝐇ᴏɢʏᴀ 𝐀ʙ 𝐓ᴏ 𝐒ɪᴅʜᴀ 𝐕ɪʀᴀʟ 𝐇ᴏɢᴀ 𝐘ᴇ ˙✧˖°📷༘ ⋆｡° 👾",
+    "𓂃✍︎ 𝑵ʏ 𝑵ʏ 𝑨ʙ 𝑲ᴜᴄʜ 𝑵ʏ 𝑯ᴏ 𝑺ᴋᴛᴀ 𝑻ᴇʀɪ 𝑪ᴜᴅᴀɪ 𝑲ɪ 𝑺ᴄʀɪᴘᴛ 𝑨ʙ 𝑳ᴇᴀᴋ 𝑯ᴏᴋᴇ 𝑯ʏ 𝑴ᴀɴᴇɢɪ 𓂃✍︎ 👾",
+    "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭 👾",
 ]
+
 flag_texts = [
-    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʜᴀᴍʟᴀ ᴋᴀʀ ᴅᴜɴɢᴀ 👾",
-    "ᴀᴘɴɪ ᴍᴀᴀ ᴋᴏ ꜱᴀᴍʙʜᴀʟ ᴋᴇ ʀᴀᴋʜ 👾",
-    "ʙᴏʟ ᴋʏᴀ ᴘʀᴏʙʟᴇᴍ ʜᴀɪ 👾",
-    "ᴋʏᴀ ʀᴇ ɢᴀɴᴅᴜ 👾",
-    "ᴍᴀᴀ ᴄʜᴜᴅᴀ ᴀᴘɴɪ 👾",
-    "ᴄʜᴜᴅ ᴊᴀ ᴄʜᴜᴘᴄʜᴀᴘ 👾",
-    "ᴀᴀ ᴊᴀ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀᴀʀᴜ 👾",
-    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴀɪꜱɪ ʜᴀɪ 👾",
+    " ོ༘₊⁺🇮🇳 ₊⁺⋆.˚ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ 𝐒𝐇𝐀𝐃𝐎𝐖 𝐁ᴀᴀᴘ 𝐀ᴜʀ 𝐈ɴᴅɪᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ོ༘₊⁺🇮🇳 ₊⁺⋆.˚ 👾",
+    " ོ༘₊⁺🇯🇵 ₊⁺⋆.˚ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ 𝐒𝐇𝐀𝐃𝐎𝐖 𝐁ᴀᴀᴘ 𝐀ᴜʀ 𝐉ᴀᴘᴀɴ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ོ༘₊⁺🇯🇵 ₊⁺⋆. 👾",
+    " ₊⁺🇺🇸 ₊⁺⋆.˚ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ 𝐒𝐇𝐀𝐃𝐎𝐖 𝐁ᴀᴀᴘ 𝐀ᴜʀ 𝐔𝐒𝐀 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ོ༘₊⁺🇺🇸 ₊⁺⋆.˚ 👾",
+    " ོ༘₊⁺🇬🇧 ₊⁺⋆.˚ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ 𝐒𝐇𝐀𝐃𝐎𝐖 𝐁ᴀᴀᴘ 𝐀ᴜʀ 𝐔𝐊 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ོ༘₊⁺🇬🇧 ₊⁺⋆.˚ 👾",
+    " ོ༘₊⁺🇰🇷 ₊⁺⋆.˚𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ 𝐒𝐇𝐀𝐃𝐎𝐖 𝐁ᴀᴀᴘ 𝐀ᴜʀ 𝐊ᴏʀᴇᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ོ༘₊⁺🇰🇷 ₊⁺⋆.˚ 👾",
+    " ོ༘₊⁺🇩🇪 ₊⁺⋆.˚ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ 𝐒𝐇𝐀𝐃𝐎𝐖 𝐁ᴀᴀᴘ 𝐀ᴜʀ 𝐆ᴇʀᴍᴀɴʏ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ོ༘₊⁺🇩🇪 ₊⁺⋆.˚ 👾",
+    " ོ༘₊⁺🇫🇷 ₊⁺⋆.˚𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ 𝐒𝐇𝐀𝐃𝐎𝐖 𝐁ᴀᴀᴘ 𝐀ᴜʀ 𝐅ʀᴀɴᴄᴇ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ོ༘₊⁺🇫🇷 ₊⁺⋆.˚ 👾",
+    " ོ༘₊⁺🇮🇹 ₊⁺⋆.˚ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ 𝐒𝐇𝐀𝐃𝐎𝐖 𝐁ᴀᴀᴘ 𝐀ᴜʀ 𝐈ᴛᴀʟʏ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ོ༘₊⁺🇮🇹 ₊⁺⋆.˚ 👾",
+    " ོ༘₊⁺🇧🇷 ₊⁺⋆.˚𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ 𝐒𝐇𝐀𝐃𝐎𝐖 𝐁ᴀᴀᴘ 𝐀ᴜʀ 𝐁ʀᴀᴢɪʟ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ོ༘₊⁺🇧🇷 ₊⁺⋆.˚ 👾",
+    " ོ༘₊⁺🇨🇦 ₊⁺⋆.˚𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ 𝐒𝐇𝐀𝐃𝐎𝐖 𝐁ᴀᴀᴘ 𝐀ᴜʀ 𝐂ᴀɴᴀᴅᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ོ༘₊⁺🇨🇦 ₊⁺⋆.˚ 👾",
 ]
 
 
@@ -537,6 +547,7 @@ MENU_TEXT = f"""
 
 ╭━━━━━ 👾 𝐓𝐎𝐎𝐋𝐒 ━━━━━╮
 ┃ 👾 .music / .dl / .weather
+┃ 👾 .calculator <expr>
 ┃ 👾 .voice / .voicegirl / .voiceboy
 ┃ 👾 .cookies / .setcookies / .musicdebug
 ╰━━━━━━━━━━━━━━━━━━━━╯
@@ -1185,113 +1196,23 @@ async def cmd_seen(event, arg):
            f"▸ ago  : {human_uptime(dt)}\n▸ text : {last.get('text','')[:300]}")
     await safe_edit(event, txt)
 
-
-# ---------- yt-dlp + music ----------
-def _ydl_youtube_opts(base: dict) -> dict:
-    opts = dict(base)
-    for ck_dir in (DATA_DIR, BASE_DIR):
-        ck = ck_dir / "cookies.txt"
-        if ck.exists():
-            opts["cookiefile"] = str(ck)
-            break
-    for cf_dir in (DATA_DIR, BASE_DIR):
-        cf = cf_dir / "cookies_from_browser.txt"
-        if cf.exists():
-            try:
-                br = cf.read_text(encoding="utf-8").strip().lower()
-                if br in ("chrome", "edge", "firefox", "brave", "opera", "chromium"):
-                    opts["cookiesfrombrowser"] = (br,)
-            except Exception: pass
-            break
-    return opts
-
-
-def _yt_dlp_try(query: str, out_dir: str):
-    """Try many yt-dlp strategies until one works. Returns (path, vid, info)."""
-    import glob
-
-    client_chains = [
-        ["android"],
-        ["ios"],
-        ["web_safari"],
-        ["mweb"],
-        ["tv_embedded"],
-        ["web_creator"],
-        ["web"],
-        ["android", "web_safari"],
-        ["ios", "web"],
-        ["tv"],
-        ["android", "ios", "web_safari"],
-    ]
-
-    attempts = []
-    for clients in client_chains:
-        attempts.append({
-            "extractor_args": {"youtube": {
-                "player_client": clients,
-                "player_skip": ["webpage"],
-            }},
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        })
-    # last resort — audio only, no format filter
-    attempts.append({
-        "extractor_args": {"youtube": {"player_client": ["android"]}},
-        "format": "bestaudio/best",
-    })
-    attempts.append({"format": "best"})
-
-    last_err = None
-    for i, strat in enumerate(attempts):
-        opts = _ydl_youtube_opts({
-            "outtmpl": os.path.join(out_dir, "vn_%(id)s.%(ext)s"),
-            "quiet": True, "no_warnings": True,
-            "default_search": "ytsearch1",
-            "noplaylist": True, "retries": 2,
-            "socket_timeout": 20,
-            "nocheckcertificate": True,
-            "merge_output_format": "mp4",
-            "geo_bypass": True,
-            **strat,
-        })
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(query, download=True)
-            if not info: continue
-            if "entries" in info:
-                entries = info.get("entries") or []
-                if not entries: continue
-                info = entries[0]
-            vid = info.get("id")
-            files = glob.glob(os.path.join(out_dir, f"vn_{vid}.*"))
-            files = [f for f in files
-                     if not f.endswith((".part", ".ytdl", ".webp", ".jpg", ".png", ".jpeg"))]
-            if files:
-                LOG.info(f"yt-dlp strategy #{i} succeeded clients={strat.get('extractor_args')}")
-                return files[0], vid, info
-        except Exception as e:
-            last_err = str(e)[:120]
-            LOG.warning(f"yt-dlp strategy #{i} failed: {last_err}")
-            continue
-    LOG.warning(f"all yt-dlp strategies failed — last error: {last_err}")
-    return None, None, None
-
-
-def _extract_voice_ogg(video_path: str, out_ogg: str) -> bool:
-    if not _ffmpeg_ok():
-        return False
+@register_cmd("calculator")
+async def cmd_calculator(event, arg):
+    if not arg: return await safe_edit(event, "👾 Use: `.calculator 2 + 2 * 4`")
     try:
-        cmd = [
-            "ffmpeg", "-y", "-i", video_path,
-            "-vn", "-c:a", "libopus", "-b:a", "64k",
-            "-ar", "48000", "-ac", "1",
-            out_ogg,
-        ]
-        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-        return r.returncode == 0 and os.path.isfile(out_ogg) and os.path.getsize(out_ogg) > 0
-    except Exception as e:
-        LOG.warning(f"ffmpeg extract failed: {e}")
-        return False
-
+        # safe eval
+        node = ast.parse(arg.strip(), mode='eval').body
+        ops = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv, ast.Pow: op.pow, ast.Mod: op.mod, ast.USub: op.neg}
+        def _eval(n):
+            if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)): return n.value
+            elif isinstance(n, ast.BinOp): return ops[type(n.op)](_eval(n.left), _eval(n.right))
+            elif isinstance(n, ast.UnaryOp): return ops[type(n.op)](_eval(n.operand))
+            else: raise ValueError()
+        res = _eval(node)
+        if isinstance(res, float) and res.is_integer(): res = int(res)
+        await safe_edit(event, f"👾 Result ➤ `{res}`")
+    except ZeroDivisionError: await safe_edit(event, "👾 Error: Division by zero")
+    except Exception: await safe_edit(event, "👾 Error: Invalid expression")
 
 @register_cmd("dl")
 async def cmd_dl(event, arg):
@@ -1338,46 +1259,192 @@ async def cmd_dl(event, arg):
             await safe_edit(event, f"👾 {str(e)[:120]}")
     asyncio.create_task(dl_task())
 
+# ---------- yt-dlp + music ----------
+def _ydl_youtube_opts(base: dict) -> dict:
+    opts = dict(base)
+    for ck_dir in (DATA_DIR, BASE_DIR):
+        ck = ck_dir / "cookies.txt"
+        if ck.exists():
+            opts["cookiefile"] = str(ck)
+            break
+    for cf_dir in (DATA_DIR, BASE_DIR):
+        cf = cf_dir / "cookies_from_browser.txt"
+        if cf.exists():
+            try:
+                br = cf.read_text(encoding="utf-8").strip().lower()
+                if br in ("chrome", "edge", "firefox", "brave", "opera", "chromium"):
+                    opts["cookiesfrombrowser"] = (br,)
+            except Exception: pass
+            break
+    return opts
+
+def _sc_try(query: str, out_dir: str):
+    """SoundCloud search + download. No bot check, works on datacenter IPs."""
+    import glob
+    opts = {
+        "outtmpl": os.path.join(out_dir, "vn_%(id)s.%(ext)s"),
+        "quiet": True, "no_warnings": True,
+        "default_search": "scsearch1",
+        "noplaylist": True, "retries": 3,
+        "socket_timeout": 20,
+        "nocheckcertificate": True,
+        "format": "bestaudio/best",
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(query, download=True)
+        if not info:
+            return None, None, None
+        if "entries" in info:
+            entries = info.get("entries") or []
+            if not entries:
+                return None, None, None
+            info = entries[0]
+        vid = info.get("id")
+        files = glob.glob(os.path.join(out_dir, f"vn_{vid}.*"))
+        files = [f for f in files if not f.endswith((".part", ".ytdl", ".webp", ".jpg", ".png", ".jpeg"))]
+        if files:
+            LOG.info(f"sc download OK: {vid}")
+            return files[0], vid, info
+    except Exception as e:
+        LOG.warning(f"sc failed: {str(e)[:150]}")
+    return None, None, None
+
+def _yt_dlp_try_fast(query: str, out_dir: str):
+    """Fast YouTube attempt — 3 strategies max. Fails fast on datacenter IPs."""
+    import glob
+    strategies = [
+        {"extractor_args": {"youtube": {"player_client": ["android_vr"], "player_skip": ["webpage", "configs"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["web_safari"], "player_skip": ["webpage"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["tv_embedded"]}}},
+    ]
+    for i, strat in enumerate(strategies):
+        opts = _ydl_youtube_opts({
+            "outtmpl": os.path.join(out_dir, "vn_%(id)s.%(ext)s"),
+            "quiet": True, "no_warnings": True,
+            "default_search": "ytsearch1",
+            "noplaylist": True, "retries": 1,
+            "socket_timeout": 15,
+            "nocheckcertificate": True,
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "merge_output_format": "mp4",
+            **strat,
+        })
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(query, download=True)
+            if not info:
+                continue
+            if "entries" in info:
+                e = info.get("entries") or []
+                if not e:
+                    continue
+                info = e[0]
+            vid = info.get("id")
+            files = glob.glob(os.path.join(out_dir, f"vn_{vid}.*"))
+            files = [f for f in files if not f.endswith((".part", ".ytdl", ".webp", ".jpg", ".png", ".jpeg"))]
+            if files:
+                LOG.info(f"yt fast strategy #{i} worked")
+                return files[0], vid, info
+        except Exception as e:
+            LOG.warning(f"yt fast #{i} fail: {str(e)[:100]}")
+            continue
+    return None, None, None
+
+def _extract_voice_ogg(video_path: str, out_ogg: str) -> bool:
+    if not _ffmpeg_ok():
+        return False
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path,
+            "-vn", "-c:a", "libopus", "-b:a", "64k",
+            "-ar", "48000", "-ac", "1",
+            out_ogg,
+        ]
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+        return r.returncode == 0 and os.path.isfile(out_ogg) and os.path.getsize(out_ogg) > 0
+    except Exception as e:
+        LOG.warning(f"ffmpeg extract failed: {e}")
+        return False
 
 @register_cmd("music")
 async def cmd_music(event, arg):
     """
-    .music <song>   → video + voice note (both)
-    .music a <song> → audio / voice note only
-    .music v <song> → video only
+    .music <song>       → SoundCloud first, YouTube fallback
+    .music a <song>     → audio / voice note only
+    .music v <song>     → video only
+    .music sc <song>    → force SoundCloud
+    .music yt <song>    → force YouTube
     """
-    if not arg: return await safe_edit(event, "Use: .music [a|v] <song>")
+    if not arg:
+        return await safe_edit(event,
+            "Use: .music [a|v|sc|yt] <song>\n"
+            "  .music <song>     → SoundCloud + YouTube fallback\n"
+            "  .music a <song>   → voice note only\n"
+            "  .music v <song>   → video only\n"
+            "  .music sc <song>  → force SoundCloud (recommended on Railway)\n"
+            "  .music yt <song>  → force YouTube (may fail on datacenter IP)")
+
     arg = arg.strip()
     mode = "both"
+    source = None
+
     if arg.startswith("a "):
         mode = "audio"; arg = arg[2:].strip()
     elif arg.startswith("v "):
         mode = "video"; arg = arg[2:].strip()
+    elif arg.startswith("sc "):
+        source = "sc"; arg = arg[3:].strip()
+    elif arg.startswith("yt "):
+        source = "yt"; arg = arg[3:].strip()
+
     query = arg
-    if not query: return await safe_edit(event, "Use: .music [a|v] <song>")
+    if not query:
+        return await safe_edit(event, "empty query")
+
+    sources = [source] if source else ["sc", "yt"]
 
     await safe_edit(event, f"🎵 Searching: {query}")
-    async def dl_task():
-        try:
-            loop = asyncio.get_event_loop()
-            out_dir = str(TMP_DIR)
-            path, vid, info = await loop.run_in_executor(None, _yt_dlp_try, query, out_dir)
-            if not path:
-                has_ck = (DATA_DIR / "cookies.txt").exists() or (BASE_DIR / "cookies.txt").exists()
-                return await safe_edit(event,
-                    "👾 Music failed on all methods.\n"
-                    f"▸ cookies : {'installed' if has_ck else 'MISSING'}\n"
-                    + ("▸ cookies present but YT still blocked — refresh cookies\n"
-                       if has_ck else
-                       "▸ send cookies.txt → reply `.setcookies`\n")
-                    + "▸ run `.musicdebug <song>` for details")
 
+    async def dl_task():
+        loop = asyncio.get_event_loop()
+        out_dir = str(TMP_DIR)
+        path, vid, info = None, None, None
+        used_src = None
+        failures = []
+
+        for src in sources:
+            if src == "sc":
+                await safe_edit(event, f"🎵 SoundCloud: {query}")
+                path, vid, info = await loop.run_in_executor(None, _sc_try, query, out_dir)
+                if path:
+                    used_src = "SoundCloud"
+                    break
+                failures.append("SoundCloud: no result")
+            elif src == "yt":
+                await safe_edit(event, f"🎵 YouTube: {query}")
+                path, vid, info = await loop.run_in_executor(None, _yt_dlp_try_fast, query, out_dir)
+                if path:
+                    used_src = "YouTube"
+                    break
+                failures.append("YouTube: blocked (datacenter IP)")
+
+        if not path:
+            return await safe_edit(event,
+                "👾 Music failed on all sources.\n"
+                "▸ " + "\n▸ ".join(failures) + "\n\n"
+                "▸ Try: `.music sc <song>` — SoundCloud only\n"
+                "▸ Try simpler query: `kesariya` instead of `kesariya full song arijit singh`\n"
+                "▸ YouTube datacenter IPs (Railway/AWS/Fly) are permanently blocked\n"
+                "▸ SoundCloud has 90% of Bollywood/indian music")
+
+        try:
             raw_ttl = (info.get("title") if isinstance(info, dict) else None) or query
             clean = re.sub(r"[^\w\s-]", "", raw_ttl).strip()[:60] or "audio"
             dur = int((info.get("duration") if isinstance(info, dict) else 0) or 0)
             uploader = (info.get("uploader") if isinstance(info, dict) else None) or BRAND
 
-            await safe_edit(event, f"🎵 Sending: {clean}")
+            await safe_edit(event, f"🎵 {used_src} → sending: {clean}")
 
             if mode in ("both", "video"):
                 try:
@@ -1386,7 +1453,7 @@ async def cmd_music(event, arg):
                         caption=f"🎬 {clean}\n👤 {uploader}\n⏱ {dur//60}:{dur%60:02d}\n✦ {BRAND} ✦",
                         supports_streaming=True,
                     )
-                    await asyncio.sleep(0.4)
+                    await asyncio.sleep(0.5)
                 except Exception as e:
                     LOG.warning(f"video send failed: {e}")
 
@@ -1401,7 +1468,7 @@ async def cmd_music(event, arg):
                         await bot.send_file(
                             event.chat_id, data,
                             voice_note=True,
-                            caption=f"🎵 {clean}\n👤 {uploader}\n✦ {BRAND} ✦",
+                            caption=f"🎵 {clean}\n👤 {uploader}",
                             attributes=[DocumentAttributeAudio(
                                 duration=dur, title=clean, performer=uploader, voice=True,
                             )],
@@ -1418,11 +1485,12 @@ async def cmd_music(event, arg):
             try: os.remove(path)
             except Exception: pass
             await safe_delete(event)
-        except Exception as e:
-            LOG.warning(f"music: {e}")
-            await safe_edit(event, f"Music error: {str(e)[:100]}")
-    asyncio.create_task(dl_task())
 
+        except Exception as e:
+            LOG.warning(f"music send: {e}")
+            await safe_edit(event, f"Music error: {str(e)[:100]}")
+
+    asyncio.create_task(dl_task())
 
 @register_cmd("musicdebug")
 async def cmd_musicdebug(event, arg):
@@ -1457,7 +1525,6 @@ async def cmd_musicdebug(event, arg):
            f"▸ detail  : {b}")
     await safe_edit(event, txt)
 
-
 # ─── cookies install ───
 @register_cmd("setcookies", needs_reply=True)
 async def cmd_setcookies(event, arg):
@@ -1476,7 +1543,6 @@ async def cmd_setcookies(event, arg):
         if not raw or len(raw) < 50:
             return await safe_edit(event, "👾 file too small / empty")
         head = raw[:300].decode("utf-8", "ignore").lower()
-        # accept netscape format (has tabs) OR any file with youtube/google domain rows
         if "\t" not in head and "youtube" not in head and "google" not in head:
             return await safe_edit(event,
                 "👾 not a cookies file\n"
@@ -1495,7 +1561,6 @@ async def cmd_setcookies(event, arg):
     except Exception as e:
         return await safe_edit(event, f"👾 install failed: {str(e)[:100]}")
 
-
 @register_cmd("cookies")
 async def cmd_cookies(event, _):
     paths = [DATA_DIR / "cookies.txt", BASE_DIR / "cookies.txt"]
@@ -1510,7 +1575,6 @@ async def cmd_cookies(event, _):
     txt = "👾 cookies status 👾\n" + "\n".join(lines)
     txt += "\n\n▸ install: send a cookies.txt → reply `.setcookies`"
     await safe_edit(event, txt)
-
 
 @register_cmd("voicegirl")
 async def cmd_voicegirl(event, arg):
@@ -1527,7 +1591,6 @@ async def cmd_voicegirl(event, arg):
     await safe_edit(event, f"👾 girl voice [{voice}]...")
     await _tts_send(event, text[:3000], voice)
 
-
 @register_cmd("voiceboy")
 async def cmd_voiceboy(event, arg):
     if not arg:
@@ -1543,7 +1606,6 @@ async def cmd_voiceboy(event, arg):
     await safe_edit(event, f"👾 boy voice [{voice}]...")
     await _tts_send(event, text[:3000], voice)
 
-
 @register_cmd("voice")
 async def cmd_voice(event, arg):
     if not arg: return await safe_edit(event, "Use: .voice <text>")
@@ -1551,7 +1613,6 @@ async def cmd_voice(event, arg):
         return await safe_edit(event, "👾 edge-tts missing. Run: pip install edge-tts")
     await safe_edit(event, "👾 voice...")
     await _tts_send(event, arg[:3000], GIRL_VOICES[0])
-
 
 @register_cmd("weather")
 async def cmd_weather(event, arg):
