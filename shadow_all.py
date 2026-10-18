@@ -24,6 +24,7 @@ import time
 import traceback
 import ast
 import operator as op
+import glob
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
@@ -294,7 +295,7 @@ reply_texts = [
     "Hello hello?? Oxygen aarahi है? रण्डी पुत्र 🧘🏻 👾",
     "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन 𝐒𝐇𝐀𝐃𝐎𝐖 /\\~ 👑 बाप से सही chudi 🥵🔥 👾",
     "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ 𝐒𝐇𝐀𝐃𝐎𝐖 बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥 👾",
-    "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝐒𝐻 𝑀𝐸 तेरी मां घर घर जाके MOAN करती है ! 🛐 👾",
+    "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके MOAN करती है ! 🛐 👾",
 ]
 
 fun_texts = [
@@ -546,10 +547,12 @@ MENU_TEXT = f"""
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐓𝐎𝐎𝐋𝐒 ━━━━━╮
-┃ 👾 .music / .dl / .weather
+┃ 👾 .song <query>   » audio / voice note
+┃ 👾 .video <query>  » mp4 video
+┃ 👾 .insta <url>    » instagram dl
 ┃ 👾 .calculator <expr>
 ┃ 👾 .voice / .voicegirl / .voiceboy
-┃ 👾 .cookies / .setcookies / .musicdebug
+┃ 👾 .cookies / .setcookies
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━━━ 👾 𝐏𝐑𝐎𝐅𝐈𝐋𝐄 ━━━╮
@@ -1200,7 +1203,6 @@ async def cmd_seen(event, arg):
 async def cmd_calculator(event, arg):
     if not arg: return await safe_edit(event, "👾 Use: `.calculator 2 + 2 * 4`")
     try:
-        # safe eval
         node = ast.parse(arg.strip(), mode='eval').body
         ops = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv, ast.Pow: op.pow, ast.Mod: op.mod, ast.USub: op.neg}
         def _eval(n):
@@ -1214,52 +1216,7 @@ async def cmd_calculator(event, arg):
     except ZeroDivisionError: await safe_edit(event, "👾 Error: Division by zero")
     except Exception: await safe_edit(event, "👾 Error: Invalid expression")
 
-@register_cmd("dl")
-async def cmd_dl(event, arg):
-    if not arg: return await safe_edit(event, "Use: .dl <url>")
-    url = arg.strip()
-    if not url.startswith(("http://", "https://")): url = "https://" + url
-    await safe_edit(event, "👾 Downloading...")
-    async def dl_task():
-        try:
-            import glob
-            loop = asyncio.get_event_loop()
-            base = os.path.join(str(DL_DIR), f"dl_{event.id}_{int(time.time())}")
-            opts = _ydl_youtube_opts({
-                "format": "best[filesize<80M]/best",
-                "outtmpl": f"{base}.%(ext)s",
-                "quiet": True, "no_warnings": True,
-                "nocheckcertificate": True, "retries": 5,
-                "noplaylist": False, "ignoreerrors": True,
-                "user_agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                               "AppleWebKit/537.36 (KHTML, like Gecko) "
-                               "Chrome/120.0.0.0 Safari/537.36"),
-            })
-            def run():
-                with yt_dlp.YoutubeDL(opts) as ydl: return ydl.extract_info(url, download=True)
-            info = await loop.run_in_executor(None, run)
-            files = [f for f in glob.glob(f"{base}.*") if not f.endswith((".part", ".ytdl"))]
-            if not files: return await safe_edit(event, "👾 Download failed")
-            caption = f"👾 {BRAND} 👾"
-            if isinstance(info, dict):
-                title = info.get("title") or ""
-                if title: caption += f"\n\n{title[:150]}"
-            sent = 0
-            for f in files:
-                try:
-                    await bot.send_file(event.chat_id, f, caption=caption if sent == 0 else "")
-                    sent += 1
-                except Exception: pass
-            for f in files:
-                try: os.remove(f)
-                except Exception: pass
-            await safe_delete(event)
-        except Exception as e:
-            LOG.warning(f"dl: {e}")
-            await safe_edit(event, f"👾 {str(e)[:120]}")
-    asyncio.create_task(dl_task())
-
-# ---------- yt-dlp + music ----------
+# ---------- yt-dlp helpers ----------
 def _ydl_youtube_opts(base: dict) -> dict:
     opts = dict(base)
     for ck_dir in (DATA_DIR, BASE_DIR):
@@ -1279,8 +1236,6 @@ def _ydl_youtube_opts(base: dict) -> dict:
     return opts
 
 def _sc_try(query: str, out_dir: str):
-    """SoundCloud search + download. No bot check, works on datacenter IPs."""
-    import glob
     opts = {
         "outtmpl": os.path.join(out_dir, "vn_%(id)s.%(ext)s"),
         "quiet": True, "no_warnings": True,
@@ -1293,239 +1248,253 @@ def _sc_try(query: str, out_dir: str):
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(query, download=True)
-        if not info:
-            return None, None, None
+        if not info: return None, None, None
         if "entries" in info:
             entries = info.get("entries") or []
-            if not entries:
-                return None, None, None
+            if not entries: return None, None, None
             info = entries[0]
         vid = info.get("id")
         files = glob.glob(os.path.join(out_dir, f"vn_{vid}.*"))
         files = [f for f in files if not f.endswith((".part", ".ytdl", ".webp", ".jpg", ".png", ".jpeg"))]
-        if files:
-            LOG.info(f"sc download OK: {vid}")
-            return files[0], vid, info
+        if files: return files[0], vid, info
     except Exception as e:
         LOG.warning(f"sc failed: {str(e)[:150]}")
     return None, None, None
 
-def _yt_dlp_try_fast(query: str, out_dir: str):
-    """Fast YouTube attempt — 3 strategies max. Fails fast on datacenter IPs."""
-    import glob
-    strategies = [
-        {"extractor_args": {"youtube": {"player_client": ["android_vr"], "player_skip": ["webpage", "configs"]}}},
-        {"extractor_args": {"youtube": {"player_client": ["web_safari"], "player_skip": ["webpage"]}}},
-        {"extractor_args": {"youtube": {"player_client": ["tv_embedded"]}}},
+def _yt_audio_try(query: str, out_dir: str):
+    opts = _ydl_youtube_opts({
+        "outtmpl": os.path.join(out_dir, "vn_%(id)s.%(ext)s"),
+        "quiet": True, "no_warnings": True,
+        "default_search": "ytsearch1",
+        "noplaylist": True, "retries": 1,
+        "socket_timeout": 15,
+        "nocheckcertificate": True,
+        "format": "bestaudio/best",
+        "extractor_args": {"youtube": {"player_client": ["android_vr", "ios"]}}
+    })
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(query, download=True)
+        if not info: return None, None, None
+        if "entries" in info:
+            e = info.get("entries") or []
+            if not e: return None, None, None
+            info = e[0]
+        vid = info.get("id")
+        files = glob.glob(os.path.join(out_dir, f"vn_{vid}.*"))
+        files = [f for f in files if not f.endswith((".part", ".ytdl", ".webp", ".jpg", ".png", ".jpeg"))]
+        if files: return files[0], vid, info
+    except Exception as e:
+        LOG.warning(f"yt audio fail: {str(e)[:100]}")
+    return None, None, None
+
+def _video_try(query: str, out_dir: str):
+    sources = [
+        ("YouTube", "ytsearch1", ["android_vr", "ios", "web_safari", "tv_embedded"]),
+        ("Dailymotion", "dailymotionsearch1", None),
+        ("Vimeo", "vimeosearch1", None),
     ]
-    for i, strat in enumerate(strategies):
+    for source_name, search_prefix, clients in sources:
         opts = _ydl_youtube_opts({
             "outtmpl": os.path.join(out_dir, "vn_%(id)s.%(ext)s"),
             "quiet": True, "no_warnings": True,
-            "default_search": "ytsearch1",
+            "default_search": search_prefix,
             "noplaylist": True, "retries": 1,
             "socket_timeout": 15,
             "nocheckcertificate": True,
             "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "merge_output_format": "mp4",
-            **strat,
         })
+        if clients:
+            opts["extractor_args"] = {"youtube": {"player_client": clients, "player_skip": ["webpage"]}}
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(query, download=True)
-            if not info:
-                continue
+            if not info: continue
             if "entries" in info:
                 e = info.get("entries") or []
-                if not e:
-                    continue
+                if not e: continue
                 info = e[0]
             vid = info.get("id")
             files = glob.glob(os.path.join(out_dir, f"vn_{vid}.*"))
             files = [f for f in files if not f.endswith((".part", ".ytdl", ".webp", ".jpg", ".png", ".jpeg"))]
             if files:
-                LOG.info(f"yt fast strategy #{i} worked")
+                LOG.info(f"Video download OK from {source_name}: {vid}")
                 return files[0], vid, info
         except Exception as e:
-            LOG.warning(f"yt fast #{i} fail: {str(e)[:100]}")
+            LOG.warning(f"{source_name} failed: {str(e)[:100]}")
             continue
     return None, None, None
 
 def _extract_voice_ogg(video_path: str, out_ogg: str) -> bool:
-    if not _ffmpeg_ok():
-        return False
+    if not _ffmpeg_ok(): return False
     try:
-        cmd = [
-            "ffmpeg", "-y", "-i", video_path,
-            "-vn", "-c:a", "libopus", "-b:a", "64k",
-            "-ar", "48000", "-ac", "1",
-            out_ogg,
-        ]
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "libopus", "-b:a", "64k", "-ar", "48000", "-ac", "1", out_ogg]
         r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
         return r.returncode == 0 and os.path.isfile(out_ogg) and os.path.getsize(out_ogg) > 0
     except Exception as e:
         LOG.warning(f"ffmpeg extract failed: {e}")
         return False
 
-@register_cmd("music")
-async def cmd_music(event, arg):
-    """
-    .music <song>       → SoundCloud first, YouTube fallback
-    .music a <song>     → audio / voice note only
-    .music v <song>     → video only
-    .music sc <song>    → force SoundCloud
-    .music yt <song>    → force YouTube
-    """
-    if not arg:
-        return await safe_edit(event,
-            "Use: .music [a|v|sc|yt] <song>\n"
-            "  .music <song>     → SoundCloud + YouTube fallback\n"
-            "  .music a <song>   → voice note only\n"
-            "  .music v <song>   → video only\n"
-            "  .music sc <song>  → force SoundCloud (recommended on Railway)\n"
-            "  .music yt <song>  → force YouTube (may fail on datacenter IP)")
-
-    arg = arg.strip()
-    mode = "both"
-    source = None
-
-    if arg.startswith("a "):
-        mode = "audio"; arg = arg[2:].strip()
-    elif arg.startswith("v "):
-        mode = "video"; arg = arg[2:].strip()
-    elif arg.startswith("sc "):
-        source = "sc"; arg = arg[3:].strip()
-    elif arg.startswith("yt "):
-        source = "yt"; arg = arg[3:].strip()
-
-    query = arg
-    if not query:
-        return await safe_edit(event, "empty query")
-
-    sources = [source] if source else ["sc", "yt"]
-
-    await safe_edit(event, f"🎵 Searching: {query}")
-
+@register_cmd("song")
+async def cmd_song(event, arg):
+    if not arg: return await safe_edit(event, "👾 Usage: `.song <song name>`")
+    query = arg.strip()
+    await safe_edit(event, f"🎵 Searching Audio: {query}")
     async def dl_task():
         loop = asyncio.get_event_loop()
         out_dir = str(TMP_DIR)
         path, vid, info = None, None, None
-        used_src = None
-        failures = []
 
-        for src in sources:
-            if src == "sc":
-                await safe_edit(event, f"🎵 SoundCloud: {query}")
-                path, vid, info = await loop.run_in_executor(None, _sc_try, query, out_dir)
-                if path:
-                    used_src = "SoundCloud"
-                    break
-                failures.append("SoundCloud: no result")
-            elif src == "yt":
-                await safe_edit(event, f"🎵 YouTube: {query}")
-                path, vid, info = await loop.run_in_executor(None, _yt_dlp_try_fast, query, out_dir)
-                if path:
-                    used_src = "YouTube"
-                    break
-                failures.append("YouTube: blocked (datacenter IP)")
-
+        await safe_edit(event, f"🎵 SoundCloud: {query}")
+        path, vid, info = await loop.run_in_executor(None, _sc_try, query, out_dir)
+        
         if not path:
-            return await safe_edit(event,
-                "👾 Music failed on all sources.\n"
-                "▸ " + "\n▸ ".join(failures) + "\n\n"
-                "▸ Try: `.music sc <song>` — SoundCloud only\n"
-                "▸ Try simpler query: `kesariya` instead of `kesariya full song arijit singh`\n"
-                "▸ YouTube datacenter IPs (Railway/AWS/Fly) are permanently blocked\n"
-                "▸ SoundCloud has 90% of Bollywood/indian music")
-
+            await safe_edit(event, f"🎵 YouTube: {query}")
+            path, vid, info = await loop.run_in_executor(None, _yt_audio_try, query, out_dir)
+        
+        if not path:
+            return await safe_edit(event, "👾 Music failed on all sources.")
+        
         try:
             raw_ttl = (info.get("title") if isinstance(info, dict) else None) or query
             clean = re.sub(r"[^\w\s-]", "", raw_ttl).strip()[:60] or "audio"
             dur = int((info.get("duration") if isinstance(info, dict) else 0) or 0)
             uploader = (info.get("uploader") if isinstance(info, dict) else None) or BRAND
-
-            await safe_edit(event, f"🎵 {used_src} → sending: {clean}")
-
-            if mode in ("both", "video"):
-                try:
-                    await bot.send_file(
-                        event.chat_id, path,
-                        caption=f"🎬 {clean}\n👤 {uploader}\n⏱ {dur//60}:{dur%60:02d}\n✦ {BRAND} ✦",
-                        supports_streaming=True,
-                    )
-                    await asyncio.sleep(0.5)
-                except Exception as e:
-                    LOG.warning(f"video send failed: {e}")
-
-            if mode in ("both", "audio"):
-                ogg = os.path.join(out_dir, f"vn_{vid or int(time.time())}.ogg")
-                ok = await loop.run_in_executor(None, _extract_voice_ogg, path, ogg)
-                if ok:
-                    try:
-                        with open(ogg, "rb") as fh:
-                            data = BytesIO(fh.read())
-                        data.name = f"{clean}.ogg"
-                        await bot.send_file(
-                            event.chat_id, data,
-                            voice_note=True,
-                            caption=f"🎵 {clean}\n👤 {uploader}",
-                            attributes=[DocumentAttributeAudio(
-                                duration=dur, title=clean, performer=uploader, voice=True,
-                            )],
-                        )
-                    except Exception as e:
-                        LOG.warning(f"voice send failed: {e}")
-                    finally:
-                        try: os.remove(ogg)
-                        except Exception: pass
-                else:
-                    if mode == "audio":
-                        await safe_edit(event, "👾 ffmpeg missing — voice note needs ffmpeg")
-
+            
+            await safe_edit(event, f"🎵 Converting to Voice Note: {clean}")
+            ogg = os.path.join(out_dir, f"vn_{vid or int(time.time())}.ogg")
+            ok = await loop.run_in_executor(None, _extract_voice_ogg, path, ogg)
+            
+            if ok:
+                with open(ogg, "rb") as fh:
+                    data = BytesIO(fh.read())
+                data.name = f"{clean}.ogg"
+                await bot.send_file(
+                    event.chat_id, data, voice_note=True, caption=f"🎵 {clean}\n👤 {uploader}",
+                    attributes=[DocumentAttributeAudio(duration=dur, title=clean, performer=uploader, voice=True)]
+                )
+                try: os.remove(ogg)
+                except Exception: pass
+            else:
+                await safe_edit(event, "👾 ffmpeg missing or conversion failed.")
+            
             try: os.remove(path)
             except Exception: pass
             await safe_delete(event)
-
         except Exception as e:
-            LOG.warning(f"music send: {e}")
-            await safe_edit(event, f"Music error: {str(e)[:100]}")
-
+            LOG.error(f"song send error: {e}")
+            await safe_edit(event, f"👾 Error: {str(e)[:100]}")
     asyncio.create_task(dl_task())
 
-@register_cmd("musicdebug")
-async def cmd_musicdebug(event, arg):
-    if not arg: return await safe_edit(event, "Use: .musicdebug <song>")
+@register_cmd("video")
+async def cmd_video(event, arg):
+    if not arg: return await safe_edit(event, "👾 Usage: `.video <query>`")
     query = arg.strip()
-    await safe_edit(event, f"👾 probing: {query}...")
-    def _probe():
-        opts = _ydl_youtube_opts({
-            "format": "bestaudio/best",
-            "quiet": True, "no_warnings": True,
-            "skip_download": True,
-            "default_search": "ytsearch1",
-            "socket_timeout": 15,
-        })
+    await safe_edit(event, f"🎬 Searching Video: {query}")
+    async def dl_task():
+        loop = asyncio.get_event_loop()
+        out_dir = str(TMP_DIR)
+        path, vid, info = await loop.run_in_executor(None, _video_try, query, out_dir)
+        if not path:
+            return await safe_edit(event, "👾 Video download failed. Datacenter IPs may be blocked.")
+        
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(query, download=False)
-            if "entries" in info: info = info["entries"][0]
-            return "OK", info.get("id"), (info.get("title") or "")[:80]
+            raw_ttl = (info.get("title") if isinstance(info, dict) else None) or query
+            clean = re.sub(r"[^\w\s-]", "", raw_ttl).strip()[:60] or "video"
+            dur = int((info.get("duration") if isinstance(info, dict) else 0) or 0)
+            uploader = (info.get("uploader") if isinstance(info, dict) else None) or BRAND
+            
+            width = int(info.get("width") or 1280)
+            height = int(info.get("height") or 720)
+            
+            if not path.endswith(".mp4"):
+                new_path = path.rsplit(".", 1)[0] + ".mp4"
+                os.rename(path, new_path)
+                path = new_path
+
+            await safe_edit(event, f"🎬 Sending: {clean}")
+            
+            await bot.send_file(
+                event.chat_id, path,
+                caption=f"🎬 {clean}\n👤 {uploader}\n⏱ {dur//60}:{dur%60:02d}\n✦ {BRAND} ✦",
+                attributes=[DocumentAttributeVideo(
+                    duration=dur,
+                    w=width,
+                    h=height,
+                    supports_streaming=True
+                )]
+            )
+            
+            try: os.remove(path)
+            except Exception: pass
+            await safe_delete(event)
+            
         except Exception as e:
-            return "ERR", type(e).__name__, str(e)[:400]
-    loop = asyncio.get_event_loop()
-    status, a, b = await loop.run_in_executor(None, _probe)
-    ck = DATA_DIR / "cookies.txt"
-    ck_ok = ck.exists()
-    ck_size = ck.stat().st_size if ck_ok else 0
-    txt = (f"👾 music debug 👾\n"
-           f"▸ cookies : {'yes' if ck_ok else 'NO'} ({ck_size}B)\n"
-           f"▸ yt-dlp  : {yt_dlp.version.__version__}\n"
-           f"▸ status  : {status}\n"
-           f"▸ info    : {a}\n"
-           f"▸ detail  : {b}")
+            LOG.error(f"video send error: {e}")
+            await safe_edit(event, f"👾 Error: {str(e)[:100]}")
+    asyncio.create_task(dl_task())
+
+@register_cmd("insta")
+async def cmd_insta(event, arg):
+    if not arg: return await safe_edit(event, "👾 Usage: `.insta <url>`")
+    url = arg.strip()
+    if "instagram.com" not in url:
+        return await safe_edit(event, "👾 Provide a valid Instagram link.")
+    
+    await safe_edit(event, "📥 Downloading from Instagram...")
+    async def dl_task():
+        try:
+            loop = asyncio.get_event_loop()
+            out_dir = str(TMP_DIR)
+            opts = {
+                "outtmpl": os.path.join(out_dir, "insta_%(id)s.%(ext)s"),
+                "quiet": True, "no_warnings": True,
+                "retries": 3, "nocheckcertificate": True,
+            }
+            def run():
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(url, download=True)
+            info = await loop.run_in_executor(None, run)
+            
+            if not info: return await safe_edit(event, "👾 Failed to fetch.")
+            if "entries" in info: info = info["entries"][0]
+            
+            vid = info.get("id")
+            files = glob.glob(os.path.join(out_dir, f"insta_{vid}.*"))
+            if not files: return await safe_edit(event, "👾 Download failed.")
+            
+            file_path = files[0]
+            title = (info.get("title") or "Instagram Media")[:50]
+            
+            if file_path.endswith((".mp4", ".mkv", ".webm")):
+                await bot.send_file(event.chat_id, file_path, caption=f"🎬 {title}\n✦ {BRAND} ✦", supports_streaming=True)
+            else:
+                await bot.send_file(event.chat_id, file_path, caption=f"🖼️ {title}\n✦ {BRAND} ✦")
+                
+            try: os.remove(file_path)
+            except Exception: pass
+            await safe_delete(event)
+        except Exception as e:
+            LOG.error(f"Insta dl error: {e}")
+            await safe_edit(event, f"👾 Error: {str(e)[:100]}")
+    asyncio.create_task(dl_task())
+
+@register_cmd("cookies")
+async def cmd_cookies(event, _):
+    paths = [DATA_DIR / "cookies.txt", BASE_DIR / "cookies.txt"]
+    lines = []
+    for p in paths:
+        if p.exists():
+            size = p.stat().st_size
+            mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(p.stat().st_mtime))
+            lines.append(f"▸ ✅ `{p}` — {size}B · {mtime}")
+        else:
+            lines.append(f"▸ ❌ `{p}`")
+    txt = "👾 cookies status 👾\n" + "\n".join(lines)
+    txt += "\n\n▸ install: send a cookies.txt → reply `.setcookies`"
     await safe_edit(event, txt)
 
-# ─── cookies install ───
 @register_cmd("setcookies", needs_reply=True)
 async def cmd_setcookies(event, arg):
     reply = await event.get_reply_message()
@@ -1556,25 +1525,10 @@ async def cmd_setcookies(event, arg):
             f"👾 cookies installed ✅\n"
             f"▸ saved : `{target}`\n"
             f"▸ size  : {len(raw)} bytes\n"
-            f"▸ now run `.music <song>` — YT auth should work\n"
+            f"▸ now run `.video <song>` — YT auth should work\n"
             f"▸ if still fails, run `.restart` first")
     except Exception as e:
         return await safe_edit(event, f"👾 install failed: {str(e)[:100]}")
-
-@register_cmd("cookies")
-async def cmd_cookies(event, _):
-    paths = [DATA_DIR / "cookies.txt", BASE_DIR / "cookies.txt"]
-    lines = []
-    for p in paths:
-        if p.exists():
-            size = p.stat().st_size
-            mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(p.stat().st_mtime))
-            lines.append(f"▸ ✅ `{p}` — {size}B · {mtime}")
-        else:
-            lines.append(f"▸ ❌ `{p}`")
-    txt = "👾 cookies status 👾\n" + "\n".join(lines)
-    txt += "\n\n▸ install: send a cookies.txt → reply `.setcookies`"
-    await safe_edit(event, txt)
 
 @register_cmd("voicegirl")
 async def cmd_voicegirl(event, arg):
@@ -2662,7 +2616,9 @@ async def _finalize(update, context, chat_id: int):
         "All commands are live — try `.menu` in any chat.\n\n"
         "`.clear on` → nuke every GC title/photo change msg.\n"
         "`.mutegc on` → mute an entire GC (auto-deletes non-owner msgs).\n"
-        "`.music <song>` → video + voice note both.\n"
+        "`.song <query>` → audio / voice note.\n"
+        "`.video <query>` → mp4 video.\n"
+        "`.insta <url>` → instagram dl.\n"
         "`.voicegirl` / `.voiceboy` → girl/boy TTS voice notes.\n\n"
         "Press the button below to log out completely at any time.",
         reply_markup=kb,
