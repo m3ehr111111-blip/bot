@@ -18,6 +18,7 @@ import os
 import random
 import re
 import signal
+
 import subprocess
 import sys
 import time
@@ -41,7 +42,7 @@ for d in (DATA_DIR, USERS_DIR, SESS_DIR, RUN_DIR, DL_DIR, TMP_DIR):
 
 BOT_TOKEN = os.environ.get(
     "SHADOW_BOT_TOKEN",
-    "8855726336:AAFgXfhKTssjc9QSRwa0dhoBOWToqF_OjDo",
+    "8855726336:AAGjdBDibZeizfrFaLNAeikOFl2GAeXN-p0",
 )
 
 logging.disable(logging.WARNING)
